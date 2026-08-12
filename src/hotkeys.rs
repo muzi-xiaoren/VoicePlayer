@@ -1,4 +1,4 @@
-﻿//! 全局热键：使用 Windows 低级键盘钩子（WH_KEYBOARD_LL）。
+//! 全局热键：使用 Windows 低级键盘钩子（WH_KEYBOARD_LL）。
 //!
 //! 与 RegisterHotKey 不同，低级钩子有以下优势：
 //! - 不吞按键事件（始终调用 CallNextHookEx），绑定的键仍能正常打字。
@@ -143,7 +143,7 @@ struct HookShared {
     actions: Mutex<HashMap<u32, HkAction>>,
     locked: AtomicBool,
     capturing: AtomicBool,
-    capture_tx: Mutex<Option<Sender<Option<(u8, u32)>>>,
+    capture_tx: Mutex<Option<Sender<Option<(u8, u32)>>>>,
     on_action: Arc<dyn Fn(HkAction) + Send + Sync>,
 }
 static SHARED: OnceLock<Mutex<Option<Arc<HookShared>>>> = OnceLock::new();
@@ -259,13 +259,13 @@ mod win {
     pub(super) const WM_SYSKEYDOWN: usize = 0x0104;
     pub(super) const WM_SYSKEYUP: usize = 0x0105;
     pub(super) unsafe fn install_hook() -> Option<HHOOK> {
-        let hinst = GetModuleHandleW(std::ptr::null());
-        if hinst == 0 {
+        let hinst = GetModuleHandleW(std::ptr::null_mut());
+        if hinst.is_null() {
             log::error!("GetModuleHandleW 失败");
             return None;
         }
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hinst, 0);
-        if hook == 0 {
+        if hook.is_null() {
             log::error!("SetWindowsHookExW 失败");
             return None;
         }
@@ -274,7 +274,7 @@ mod win {
     pub(super) unsafe fn run_message_loop() {
         let mut msg: MSG = std::mem::zeroed();
         loop {
-            let ret = GetMessageW(&mut msg, 0, 0, 0); // HWND=isize，传 0 = 线程全部窗口
+            let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0); // HWND=isize，传 0 = 线程全部窗口
             if ret == 0 || ret == -1 {
                 break;
             }
@@ -284,6 +284,10 @@ mod win {
         UnhookWindowsHookEx(hook);
     }
     pub(super) fn get_modifiers() -> u8 {
+        use super::{
+            VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
+            VK_LSHIFT, VK_RSHIFT, MOD_CTRL, MOD_ALT, MOD_SHIFT,
+        };
         unsafe {
             let mut mods = 0u8;
             if GetAsyncKeyState(VK_LCONTROL as i32) < 0
@@ -346,7 +350,7 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
             }
         }
     }
-    unsafe { win::CallNextHookEx(0, code, wparam, lparam) }
+    unsafe { win::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 #[cfg(windows)]
 thread_local! {

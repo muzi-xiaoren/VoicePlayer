@@ -1,4 +1,4 @@
-﻿//! egui 界面 + 状态管理，把配置、音频线程、热键、profile、i18n 串起来。
+//! egui 界面 + 状态管理，把配置、音频线程、热键、profile、i18n 串起来。
 use crate::audio::{self, AudioCmd, AudioCtl};
 use crate::config::{AppConfig, RepeatMode};
 use crate::hotkeys::{self, HkAction, Hotkeys};
@@ -157,7 +157,7 @@ impl App {
         self.config.save();
         self.reregister_hotkeys();
     }
-    fn add_external_folder(&mut self, dir: PathBuf, dialog_title: &str) {
+    fn add_external_folder(&mut self, dir: PathBuf, _dialog_title: &str) {
         if let Some(name) = self
             .config
             .external_profiles
@@ -506,15 +506,19 @@ impl App {
                     if ui.button("▶").clicked() {
                         pending.play.push(i);
                     }
-                    // 文件名用截断显示，确保右侧控件始终可见不被挤出。
-                    // 先预留控件区域宽度，再让 label 用剩余空间。
-                    let controls_min = 300.0;
+                    // 给右侧控件预留固定宽度，文件名用剩余空间截断显示
                     let avail = ui.available_width();
-                    let label_max = (avail - controls_min).max(avail * 0.3).min(avail - 80.0);
-                    ui.add(
-                        egui::Label::new(&s.name)
-                            .wrap_mode(egui::TextWrapMode::Truncate)
-                            .max_width(label_max),
+                    let controls_w = 290.0_f32;
+                    let label_w = (avail - controls_w).max(60.0).min(avail - 40.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(label_w, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(&s.name)
+                                    .wrap_mode(egui::TextWrapMode::Truncate),
+                            );
+                        },
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let mut v = s.volume;
