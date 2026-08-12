@@ -8,7 +8,7 @@
 //! 钩子回调运行在独立的 Windows 消息循环线程里，不依赖 egui 刷帧。
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 /// 修饰键位掩码。
@@ -145,6 +145,9 @@ struct HookShared {
     capturing: AtomicBool,
     capture_tx: Mutex<Option<Sender<Option<(u8, u32)>>>>,
     on_action: Arc<dyn Fn(HkAction) + Send + Sync>,
+    hook_installed: AtomicBool,
+    dedup_key: AtomicU32,
+    dedup_time: AtomicU64,
 }
 static SHARED: OnceLock<Mutex<Option<Arc<HookShared>>>> = OnceLock::new();
 fn shared_mutex() -> &'static Mutex<Option<Arc<HookShared>>> {
@@ -166,6 +169,9 @@ impl Hotkeys {
             capturing: AtomicBool::new(false),
             capture_tx: Mutex::new(None),
             on_action: Arc::new(on_action),
+            hook_installed: AtomicBool::new(false),
+            dedup_key: AtomicU32::new(0),
+            dedup_time: AtomicU64::new(0),
         });
         #[cfg(windows)]
         {
@@ -219,8 +225,45 @@ impl Hotkeys {
             *slot = None;
         }
     }
-    pub fn is_capturing(&self) -> bool {
-        self.shared.capturing.load(Ordering::Relaxed)
+   pub fn is_capturing(&self) -> bool {
+       self.shared.capturing.load(Ordering::Relaxed)
+   }
+    /// 检查低级钩子是否成功安装。
+    pub fn hook_installed(&self) -> bool {
+        self.shared.hook_installed.load(Ordering::Relaxed)
+    }
+    /// 用 VK code 直接触发（egui 后备路径调用）。
+    pub fn trigger_from_vk(&self, mods: u8, vk: u32) {
+        self.shared.fire_if_bound(mods, vk);
+    }
+}
+
+/// 当前时间的毫秒数（用于去重时间戳）。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl HookShared {
+    /// 查找绑定并触发动作。内置锁定检查 + 去重（防止钩子和 egui 同时触发同一按键）。
+    fn fire_if_bound(&self, mods: u8, vk: u32) {
+        if self.locked.load(Ordering::Relaxed) {
+            return;
+        }
+        let key = combo_key(mods, vk);
+        let now = now_ms();
+        let prev_key = self.dedup_key.load(Ordering::Relaxed);
+        let prev_time = self.dedup_time.load(Ordering::Relaxed);
+        if prev_key == key && now.saturating_sub(prev_time) < 300 {
+            return; // 300ms 内已触发过同一个组合键，跳过
+        }
+        self.dedup_key.store(key, Ordering::Relaxed);
+        self.dedup_time.store(now, Ordering::Relaxed);
+        if let Some(action) = self.actions.lock().ok().and_then(|m| m.get(&key).cloned()) {
+            (self.on_action)(action);
+        }
     }
 }
 impl Drop for Hotkeys {
@@ -339,9 +382,8 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
                             dk.insert(key);
                             was
                         });
-                        if !already_down && !shared.locked.load(Ordering::Relaxed) {
-                            let action = shared.actions.lock().ok().and_then(|m| m.get(&key).cloned());
-                            if let Some(act) = action { (shared.on_action)(act); }
+                        if !already_down {
+                            shared.fire_if_bound(mods, vk);
                         }
                     } else if is_up {
                         DOWN_KEYS.with(|dk| { dk.borrow_mut().remove(&key); });
@@ -360,7 +402,7 @@ thread_local! {
 fn hook_thread(shared: Arc<HookShared>) {
     {
         let mut g = shared_mutex().lock().unwrap();
-        *g = Some(shared);
+        *g = Some(shared.clone());
     }
     unsafe {
         let hook = match win::install_hook() {
@@ -371,6 +413,7 @@ fn hook_thread(shared: Arc<HookShared>) {
                 return;
             }
         };
+        shared.hook_installed.store(true, Ordering::Relaxed);
         log::info!("低级键盘钩子已安装");
         win::run_message_loop();
         win::remove_hook(hook);

@@ -249,18 +249,40 @@ impl App {
                         captured = Some(None);
                         return;
                     }
+                   if let Some(vk) = egui_key_to_vk(*key) {
+                        let vk = disambiguate_numpad(vk);
+                        let mut mods = 0u8;
+                        if modifiers.ctrl { mods |= hotkeys::MOD_CTRL; }
+                        if modifiers.alt { mods |= hotkeys::MOD_ALT; }
+                       if modifiers.shift { mods |= hotkeys::MOD_SHIFT; }
+                       captured = Some(Some((mods, vk)));
+                       return;
+                   }
+                }
+            }
+       });
+       captured
+   }
+    /// 当窗口有焦点时，用 egui 键盘事件触发已绑定的快捷键（钩子失效时的后备路径）。
+    fn poll_egui_trigger(&self, ctx: &egui::Context) {
+        if self.capturing.is_some() {
+            return;
+        }
+        let Some(hk) = self.hotkeys.as_ref() else { return };
+        ctx.input(|input| {
+            for event in &input.events {
+                if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event {
                     if let Some(vk) = egui_key_to_vk(*key) {
+                        let vk = disambiguate_numpad(vk);
                         let mut mods = 0u8;
                         if modifiers.ctrl { mods |= hotkeys::MOD_CTRL; }
                         if modifiers.alt { mods |= hotkeys::MOD_ALT; }
                         if modifiers.shift { mods |= hotkeys::MOD_SHIFT; }
-                        captured = Some(Some((mods, vk)));
-                        return;
+                        hk.trigger_from_vk(mods, vk);
                     }
                 }
             }
         });
-        captured
     }
     fn apply(&mut self, pending: Pending) {
         let texts = self.texts();
@@ -575,14 +597,16 @@ impl App {
     }
 }
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.capturing.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(50));
-        } else {
-            ctx.request_repaint_after(Duration::from_millis(500));
-        }
+   fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 始终以 ~50ms 刷帧：保证快捷键触发响应及时（egui 后备触发依赖刷帧）。
+        ctx.request_repaint_after(Duration::from_millis(50));
         self.maybe_rescan();
+        let was_capturing = self.capturing.is_some();
         self.handle_capture(ctx);
+        // 捕获完成的这一帧不触发（同一个按键事件会在捕获和触发里各处理一次）
+        if !was_capturing {
+            self.poll_egui_trigger(ctx);
+        }
         let out_devices = self.out_devices.clone();
         let in_devices = self.in_devices.clone();
         let profiles = self.profiles.clone();
@@ -626,6 +650,27 @@ fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
         Key::ArrowLeft => 0x25, Key::ArrowRight => 0x27,
         _ => return None,
     })
+}
+/// 当 egui 报告的是数字键（0x30-0x39）时，检查对应的小键盘键是否按下。
+/// 如果小键盘键按下，返回小键盘 VK code（0x60-0x69），否则返回原始值。
+/// 这样主键盘的「1」和小键盘的「1」可以分别绑定不同的快捷键。
+#[cfg(windows)]
+fn disambiguate_numpad(vk: u32) -> u32 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    if (0x30..=0x39).contains(&vk) {
+        let numpad_vk = vk - 0x30 + 0x60; // Digit0=0x30 -> Numpad0=0x60
+        unsafe {
+            if GetAsyncKeyState(numpad_vk as i32) < 0 {
+                return numpad_vk;
+            }
+        }
+    }
+    vk
+}
+
+#[cfg(not(windows))]
+fn disambiguate_numpad(vk: u32) -> u32 {
+    vk
 }
 fn device_combo(
     ui: &mut egui::Ui,

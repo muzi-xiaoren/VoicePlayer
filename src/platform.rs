@@ -7,18 +7,57 @@ pub const VBCABLE_URL: &str = "https://vb-audio.com/Cable/";
 /// 设置 / 取消开机自启。
 #[cfg(windows)]
 pub fn set_autostart(enable: bool) -> anyhow::Result<()> {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW,
+        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
+    };
 
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (run, _) = hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")?;
+    fn to_wide(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
     const NAME: &str = "VoicePlayer";
-    if enable {
-        let exe = std::env::current_exe()?;
-        run.set_value(NAME, &format!("\"{}\"", exe.display()))?;
-    } else {
-        // 不存在时删除会报错，忽略即可。
-        let _ = run.delete_value(NAME);
+    let subkey = to_wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let name = to_wide(NAME);
+
+    unsafe {
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let status = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut hkey,
+            std::ptr::null_mut(),
+        );
+        if status != 0 {
+            anyhow::bail!("打开注册表项失败，错误码 {status}");
+        }
+        if enable {
+            let exe = std::env::current_exe()?;
+            let val = format!("\"{}\"", exe.display());
+            let val_wide = to_wide(&val);
+            let status = RegSetValueExW(
+                hkey,
+                name.as_ptr(),
+                0,
+                1, // REG_SZ
+                val_wide.as_ptr() as *const u8,
+                (val_wide.len() * 2) as u32,
+            );
+            RegCloseKey(hkey);
+            if status != 0 {
+                anyhow::bail!("写入注册表失败，错误码 {status}");
+            }
+        } else {
+            let _ = RegDeleteValueW(hkey, name.as_ptr());
+            RegCloseKey(hkey);
+        }
     }
     Ok(())
 }
