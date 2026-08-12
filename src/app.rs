@@ -204,12 +204,17 @@ impl App {
             }
         }
     }
-    /// 轮询钩子线程的捕获结果。
-    fn handle_capture(&mut self) {
+   /// 轮询钩子线程的捕获结果。
+    fn handle_capture(&mut self, ctx: &egui::Context) {
         if self.capturing.is_none() {
             return;
         }
-        let result = self.hotkeys.as_ref().and_then(|hk| hk.poll_capture());
+        // 先试低级钩子通道（窗口无焦点时仍可工作）
+        let mut result = self.hotkeys.as_ref().and_then(|hk| hk.poll_capture());
+        // 回退到 egui 键盘事件（窗口有焦点时更可靠）
+        if result.is_none() {
+            result = self.poll_egui_capture(ctx);
+        }
         let Some(capture_result) = result else { return };
         let target = self.capturing.take();
         if let Some(hk) = &self.hotkeys {
@@ -233,6 +238,29 @@ impl App {
             }
             self.reregister_hotkeys();
         }
+    }
+    /// 当窗口有焦点时，用 egui 自己的键盘事件来捕获快捷键（比钩子通道更可靠）。
+    fn poll_egui_capture(&self, ctx: &egui::Context) -> Option<Option<(u8, u32)>> {
+        let mut captured = None;
+        ctx.input(|input| {
+            for event in &input.events {
+                if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event {
+                    if *key == egui::Key::Escape {
+                        captured = Some(None);
+                        return;
+                    }
+                    if let Some(vk) = egui_key_to_vk(*key) {
+                        let mut mods = 0u8;
+                        if modifiers.ctrl { mods |= hotkeys::MOD_CTRL; }
+                        if modifiers.alt { mods |= hotkeys::MOD_ALT; }
+                        if modifiers.shift { mods |= hotkeys::MOD_SHIFT; }
+                        captured = Some(Some((mods, vk)));
+                        return;
+                    }
+                }
+            }
+        });
+        captured
     }
     fn apply(&mut self, pending: Pending) {
         let texts = self.texts();
@@ -548,9 +576,13 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(500));
+        if self.capturing.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
         self.maybe_rescan();
-        self.handle_capture();
+        self.handle_capture(ctx);
         let out_devices = self.out_devices.clone();
         let in_devices = self.in_devices.clone();
         let profiles = self.profiles.clone();
@@ -564,6 +596,36 @@ impl eframe::App for App {
         });
         self.apply(pending);
     }
+}
+/// 把 egui 的 Key 枚举映射成 Windows 虚拟键码（VK code），无法映射的返回 None。
+fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
+    use egui::Key;
+    Some(match key {
+        Key::A => 0x41, Key::B => 0x42, Key::C => 0x43, Key::D => 0x44,
+        Key::E => 0x45, Key::F => 0x46, Key::G => 0x47, Key::H => 0x48,
+        Key::I => 0x49, Key::J => 0x4A, Key::K => 0x4B, Key::L => 0x4C,
+        Key::M => 0x4D, Key::N => 0x4E, Key::O => 0x4F, Key::P => 0x50,
+        Key::Q => 0x51, Key::R => 0x52, Key::S => 0x53, Key::T => 0x54,
+        Key::U => 0x55, Key::V => 0x56, Key::W => 0x57, Key::X => 0x58,
+        Key::Y => 0x59, Key::Z => 0x5A,
+        Key::Num0 => 0x30, Key::Num1 => 0x31, Key::Num2 => 0x32,
+        Key::Num3 => 0x33, Key::Num4 => 0x34, Key::Num5 => 0x35,
+        Key::Num6 => 0x36, Key::Num7 => 0x37, Key::Num8 => 0x38,
+        Key::Num9 => 0x39,
+        Key::F1 => 0x70, Key::F2 => 0x71, Key::F3 => 0x72, Key::F4 => 0x73,
+        Key::F5 => 0x74, Key::F6 => 0x75, Key::F7 => 0x76, Key::F8 => 0x77,
+        Key::F9 => 0x78, Key::F10 => 0x79, Key::F11 => 0x7A, Key::F12 => 0x7B,
+        Key::Space => 0x20,
+        Key::Tab => 0x09,
+        Key::Enter => 0x0D,
+        Key::Backspace => 0x08,
+        Key::Insert => 0x2D, Key::Delete => 0x2E,
+        Key::Home => 0x24, Key::End => 0x23,
+        Key::PageUp => 0x21, Key::PageDown => 0x22,
+        Key::ArrowUp => 0x26, Key::ArrowDown => 0x28,
+        Key::ArrowLeft => 0x25, Key::ArrowRight => 0x27,
+        _ => return None,
+    })
 }
 fn device_combo(
     ui: &mut egui::Ui,
