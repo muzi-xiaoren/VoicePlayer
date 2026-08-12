@@ -1,202 +1,379 @@
-//! 全局热键：把「Ctrl+Alt+S」这样的字符串注册成系统级快捷键。
+﻿//! 全局热键：使用 Windows 低级键盘钩子（WH_KEYBOARD_LL）。
 //!
-//! 快捷键字符串由界面里「按键捕获」生成（见 `from_egui`），也可手改。
-//! 我们自己在字符串 <-> `global_hotkey::HotKey` 之间转换，不依赖第三方解析格式。
+//! 与 RegisterHotKey 不同，低级钩子有以下优势：
+//! - 不吞按键事件（始终调用 CallNextHookEx），绑定的键仍能正常打字。
+//! - 在全屏独占游戏中也能工作。
+//! - 用原始虚拟键码（VK code），精确区分主键盘数字键和小键盘数字键。
 //!
-//! 事件处理在独立线程（`spawn_listener`）里阻塞等待，不依赖 UI 刷帧——
-//! 窗口被全屏游戏遮挡、最小化时热键照样响。数字键会同时注册主键盘和
-//! 小键盘两个键位，按哪边都能触发。
-
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use std::collections::HashMap;
+//! 钩子回调运行在独立的 Windows 消息循环线程里，不依赖 egui 刷帧。
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
+/// 修饰键位掩码。
+pub const MOD_CTRL: u8 = 1;
+pub const MOD_ALT: u8 = 2;
+pub const MOD_SHIFT: u8 = 4;
 /// 热键触发后要做的事。
 #[derive(Debug, Clone)]
 pub enum HkAction {
     Play { path: PathBuf, volume: f32 },
     StopAll,
 }
-
-/// 「热键 id -> 动作」映射，注册线程（UI）和监听线程共享。
-pub type SharedActions = Arc<Mutex<HashMap<u32, HkAction>>>;
-
-/// 把界面捕获到的（修饰键 + 主键）拼成展示字符串，如 "Ctrl+Alt+S"。
-/// 返回 None 表示这个键我们不支持绑定。
-pub fn from_egui(mods: &egui::Modifiers, key: egui::Key) -> Option<String> {
-    let token = egui_key_token(key)?;
-    let mut parts = Vec::new();
-    if mods.ctrl || mods.command {
-        parts.push("Ctrl");
-    }
-    if mods.alt {
-        parts.push("Alt");
-    }
-    if mods.shift {
-        parts.push("Shift");
-    }
-    let mut s = parts.join("+");
-    if !s.is_empty() {
-        s.push('+');
-    }
-    s.push_str(token);
-    Some(s)
+// ─── VK code 常量 ───
+const VK_ESCAPE: u32 = 0x1B;
+const VK_LSHIFT: u32 = 0xA0;
+const VK_RSHIFT: u32 = 0xA1;
+const VK_LCONTROL: u32 = 0xA2;
+const VK_RCONTROL: u32 = 0xA3;
+const VK_LMENU: u32 = 0xA4;
+const VK_RMENU: u32 = 0xA5;
+/// 把（修饰键掩码 + VK code）打包成一个 u32 作为 HashMap 的键。
+fn combo_key(mods: u8, vk: u32) -> u32 {
+    ((mods as u32) << 16) | (vk & 0xFFFF)
 }
-
-/// 解析 "Ctrl+Alt+1" -> 一批 HotKey（数字/回车会展开成主键盘+小键盘两个）。
-/// 解析失败返回空 Vec。
-pub fn parse_all(combo: &str) -> Vec<HotKey> {
-    let mut mods = Modifiers::empty();
-    let mut codes: Vec<Code> = Vec::new();
-    for part in combo.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()) {
-        match part.to_lowercase().as_str() {
-            "ctrl" | "control" => mods |= Modifiers::CONTROL,
-            "alt" | "option" => mods |= Modifiers::ALT,
-            "shift" => mods |= Modifiers::SHIFT,
-            // Win/Super/Cmd 键暂不支持绑定，忽略这个修饰符
-            "win" | "super" | "meta" | "cmd" => {}
-            _ => codes = token_to_codes(part),
-        }
-    }
-    let m = if mods.is_empty() { None } else { Some(mods) };
-    codes.into_iter().map(|c| HotKey::new(m, c)).collect()
-}
-
-fn egui_key_token(key: egui::Key) -> Option<&'static str> {
-    use egui::Key::*;
-    Some(match key {
-        A => "A", B => "B", C => "C", D => "D", E => "E", F => "F", G => "G",
-        H => "H", I => "I", J => "J", K => "K", L => "L", M => "M", N => "N",
-        O => "O", P => "P", Q => "Q", R => "R", S => "S", T => "T", U => "U",
-        V => "V", W => "W", X => "X", Y => "Y", Z => "Z",
-        Num0 => "0", Num1 => "1", Num2 => "2", Num3 => "3", Num4 => "4",
-        Num5 => "5", Num6 => "6", Num7 => "7", Num8 => "8", Num9 => "9",
-        F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4", F5 => "F5", F6 => "F6",
-        F7 => "F7", F8 => "F8", F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12",
-        Space => "Space", Enter => "Enter", Tab => "Tab", Backspace => "Backspace",
-        Insert => "Insert", Delete => "Delete", Home => "Home", End => "End",
-        PageUp => "PageUp", PageDown => "PageDown",
-        ArrowUp => "Up", ArrowDown => "Down", ArrowLeft => "Left", ArrowRight => "Right",
+/// VK code → 展示用 token 字符串。None 表示不支持绑定。
+fn vk_to_token(vk: u32) -> Option<String> {
+    Some(match vk {
+        0x41..=0x5A => format!("Key{}", (vk as u8) as char),
+        0x30..=0x39 => format!("Digit{}", vk - 0x30),
+        0x60..=0x69 => format!("Numpad{}", vk - 0x60),
+        0x70..=0x7B => format!("F{}", vk - 0x6F),
+        0x20 => "Space".into(),
+        0x08 => "Backspace".into(),
+        0x09 => "Tab".into(),
+        0x0D => "Enter".into(),
+        0x2D => "Insert".into(),
+        0x2E => "Delete".into(),
+        0x24 => "Home".into(),
+        0x23 => "End".into(),
+        0x21 => "PageUp".into(),
+        0x22 => "PageDown".into(),
+        0x26 => "Up".into(),
+        0x28 => "Down".into(),
+        0x25 => "Left".into(),
+        0x27 => "Right".into(),
+        0xBA => "OemSemicolon".into(),
+        0xBB => "OemPlus".into(),
+        0xBC => "OemComma".into(),
+        0xBD => "OemMinus".into(),
+        0xBE => "OemPeriod".into(),
+        0xC0 => "OemTilde".into(),
+        0xDB => "OemLeftBracket".into(),
+        0xDC => "OemBackslash".into(),
+        0xDD => "OemRightBracket".into(),
+        0xDE => "OemQuotes".into(),
         _ => return None,
     })
 }
-
-/// token -> 键位。数字和回车展开成两个键位（主键盘 + 小键盘）。
-fn token_to_codes(t: &str) -> Vec<Code> {
-    match t.to_uppercase().as_str() {
-        "0" => vec![Code::Digit0, Code::Numpad0],
-        "1" => vec![Code::Digit1, Code::Numpad1],
-        "2" => vec![Code::Digit2, Code::Numpad2],
-        "3" => vec![Code::Digit3, Code::Numpad3],
-        "4" => vec![Code::Digit4, Code::Numpad4],
-        "5" => vec![Code::Digit5, Code::Numpad5],
-        "6" => vec![Code::Digit6, Code::Numpad6],
-        "7" => vec![Code::Digit7, Code::Numpad7],
-        "8" => vec![Code::Digit8, Code::Numpad8],
-        "9" => vec![Code::Digit9, Code::Numpad9],
-        "ENTER" => vec![Code::Enter, Code::NumpadEnter],
-        "A" => vec![Code::KeyA], "B" => vec![Code::KeyB], "C" => vec![Code::KeyC],
-        "D" => vec![Code::KeyD], "E" => vec![Code::KeyE], "F" => vec![Code::KeyF],
-        "G" => vec![Code::KeyG], "H" => vec![Code::KeyH], "I" => vec![Code::KeyI],
-        "J" => vec![Code::KeyJ], "K" => vec![Code::KeyK], "L" => vec![Code::KeyL],
-        "M" => vec![Code::KeyM], "N" => vec![Code::KeyN], "O" => vec![Code::KeyO],
-        "P" => vec![Code::KeyP], "Q" => vec![Code::KeyQ], "R" => vec![Code::KeyR],
-        "S" => vec![Code::KeyS], "T" => vec![Code::KeyT], "U" => vec![Code::KeyU],
-        "V" => vec![Code::KeyV], "W" => vec![Code::KeyW], "X" => vec![Code::KeyX],
-        "Y" => vec![Code::KeyY], "Z" => vec![Code::KeyZ],
-        "F1" => vec![Code::F1], "F2" => vec![Code::F2], "F3" => vec![Code::F3],
-        "F4" => vec![Code::F4], "F5" => vec![Code::F5], "F6" => vec![Code::F6],
-        "F7" => vec![Code::F7], "F8" => vec![Code::F8], "F9" => vec![Code::F9],
-        "F10" => vec![Code::F10], "F11" => vec![Code::F11], "F12" => vec![Code::F12],
-        "SPACE" => vec![Code::Space], "TAB" => vec![Code::Tab],
-        "BACKSPACE" => vec![Code::Backspace], "INSERT" => vec![Code::Insert],
-        "DELETE" => vec![Code::Delete], "HOME" => vec![Code::Home], "END" => vec![Code::End],
-        "PAGEUP" => vec![Code::PageUp], "PAGEDOWN" => vec![Code::PageDown],
-        "UP" => vec![Code::ArrowUp], "DOWN" => vec![Code::ArrowDown],
-        "LEFT" => vec![Code::ArrowLeft], "RIGHT" => vec![Code::ArrowRight],
-        _ => Vec::new(),
+/// token 字符串 → VK code。
+fn token_to_vk(token: &str) -> Option<u32> {
+    let t = token.to_lowercase();
+    if t.len() == 4 && t.starts_with("key") {
+        if let Some(c) = t[3..].chars().next() {
+            if c.is_ascii_alphabetic() {
+                return Some(c.to_ascii_uppercase() as u32);
+            }
+        }
     }
+    Some(match t.as_str() {
+        "digit0" | "0" => 0x30, "digit1" | "1" => 0x31,
+        "digit2" | "2" => 0x32, "digit3" | "3" => 0x33,
+        "digit4" | "4" => 0x34, "digit5" | "5" => 0x35,
+        "digit6" | "6" => 0x36, "digit7" | "7" => 0x37,
+        "digit8" | "8" => 0x38, "digit9" | "9" => 0x39,
+        "numpad0" => 0x60, "numpad1" => 0x61,
+        "numpad2" => 0x62, "numpad3" => 0x63,
+        "numpad4" => 0x64, "numpad5" => 0x65,
+        "numpad6" => 0x66, "numpad7" => 0x67,
+        "numpad8" => 0x68, "numpad9" => 0x69,
+        "f1" => 0x70, "f2" => 0x71, "f3" => 0x72,
+        "f4" => 0x73, "f5" => 0x74, "f6" => 0x75,
+        "f7" => 0x76, "f8" => 0x77, "f9" => 0x78,
+        "f10" => 0x79, "f11" => 0x7A, "f12" => 0x7B,
+        "space" => 0x20, "backspace" => 0x08,
+        "tab" => 0x09, "enter" => 0x0D,
+        "insert" => 0x2D, "delete" => 0x2E,
+        "home" => 0x24, "end" => 0x23,
+        "pageup" => 0x21, "pagedown" => 0x22,
+        "up" => 0x26, "down" => 0x28,
+        "left" => 0x25, "right" => 0x27,
+        "oemsemicolon" => 0xBA, "oemplus" => 0xBB,
+        "oemcomma" => 0xBC, "oemminus" => 0xBD,
+        "oemperiod" => 0xBE, "oemtilde" => 0xC0,
+        "oemleftbracket" => 0xDB, "oembackslash" => 0xDC,
+        "oemrightbracket" => 0xDD, "oemquotes" => 0xDE,
+        _ => return None,
+    })
 }
-
-/// 热键管理：注册一批快捷键，维护共享的「热键 id -> 动作」映射。
-/// 注意：manager 必须在主线程（有消息循环的线程）创建和注册。
+/// 把 (mods, vk) 格式化成用户可读字符串，如 "Ctrl+Alt+KeyW"。
+pub fn format_combo(mods: u8, vk: u32) -> String {
+    let token = vk_to_token(vk).unwrap_or_else(|| format!("VK{vk:02X}"));
+    let mut parts = Vec::new();
+    if mods & MOD_CTRL != 0 { parts.push("Ctrl"); }
+    if mods & MOD_ALT != 0 { parts.push("Alt"); }
+    if mods & MOD_SHIFT != 0 { parts.push("Shift"); }
+    parts.push(&token);
+    parts.join("+")
+}
+/// 解析存储的 combo 字符串 → (mods, vk)。None = 解析失败。
+pub fn parse_combo(combo: &str) -> Option<(u8, u32)> {
+    let mut mods = 0u8;
+    let mut vk: Option<u32> = None;
+    for part in combo.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        match part.to_lowercase().as_str() {
+            "ctrl" | "control" => mods |= MOD_CTRL,
+            "alt" | "option" => mods |= MOD_ALT,
+            "shift" => mods |= MOD_SHIFT,
+            "win" | "super" | "meta" | "cmd" => {}
+            tok => vk = token_to_vk(tok),
+        }
+    }
+    vk.map(|v| (mods, v))
+}
+/// 把存储的 combo 字符串美化显示。
+pub fn pretty_combo(combo: &str) -> String {
+    parse_combo(combo)
+        .map(|(m, v)| format_combo(m, v))
+        .unwrap_or_else(|| combo.to_string())
+}
+// ─── 共享状态 ───
+struct HookShared {
+    actions: Mutex<HashMap<u32, HkAction>>,
+    locked: AtomicBool,
+    capturing: AtomicBool,
+    capture_tx: Mutex<Option<Sender<Option<(u8, u32)>>>,
+    on_action: Arc<dyn Fn(HkAction) + Send + Sync>,
+}
+static SHARED: OnceLock<Mutex<Option<Arc<HookShared>>>> = OnceLock::new();
+fn shared_mutex() -> &'static Mutex<Option<Arc<HookShared>>> {
+    SHARED.get_or_init(|| Mutex::new(None))
+}
+/// UI 端的热键管理句柄。
 pub struct Hotkeys {
-    mgr: GlobalHotKeyManager,
-    current: Vec<HotKey>,
-    actions: SharedActions,
+    shared: Arc<HookShared>,
+    capture_rx: Option<Receiver<Option<(u8, u32)>>>,
 }
-
 impl Hotkeys {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new<F>(on_action: F) -> anyhow::Result<Self>
+    where
+        F: Fn(HkAction) + Send + Sync + 'static,
+    {
+        let shared = Arc::new(HookShared {
+            actions: Mutex::new(HashMap::new()),
+            locked: AtomicBool::new(false),
+            capturing: AtomicBool::new(false),
+            capture_tx: Mutex::new(None),
+            on_action: Arc::new(on_action),
+        });
+        #[cfg(windows)]
+        {
+            let s = shared.clone();
+            std::thread::Builder::new()
+                .name("hotkeys".into())
+                .spawn(move || hook_thread(s))
+                .map_err(|e| anyhow::anyhow!("创建热键线程失败：{e}"))?;
+            // 给钩子线程一点时间启动
+        }
         Ok(Self {
-            mgr: GlobalHotKeyManager::new().map_err(|e| anyhow::anyhow!("{e}"))?,
-            current: Vec::new(),
-            actions: Arc::new(Mutex::new(HashMap::new())),
+            shared,
+            capture_rx: None,
         })
     }
-
-    /// 给监听线程用的动作映射句柄。
-    pub fn actions_handle(&self) -> SharedActions {
-        self.actions.clone()
-    }
-
-    /// 注销当前所有热键。
-    pub fn clear(&mut self) {
-        if !self.current.is_empty() {
-            let _ = self.mgr.unregister_all(&self.current);
+    pub fn update_bindings(&self, bindings: &[(String, HkAction)]) {
+        let mut map = HashMap::new();
+        for (combo, action) in bindings {
+            if let Some((mods, vk)) = parse_combo(combo) {
+                map.insert(combo_key(mods, vk), action.clone());
+            } else {
+                log::warn!("无法解析快捷键「{combo}」");
+            }
         }
-        self.current.clear();
-        if let Ok(mut a) = self.actions.lock() {
+        if let Ok(mut a) = self.shared.actions.lock() {
+            *a = map;
+        }
+    }
+    pub fn clear(&self) {
+        if let Ok(mut a) = self.shared.actions.lock() {
             a.clear();
         }
     }
-
-    /// 注册一个快捷键并绑定动作。数字键会同时注册主键盘和小键盘两个键位，
-    /// 任意一个注册成功就算成功。
-    pub fn register(&mut self, combo: &str, action: HkAction) -> bool {
-        let hks = parse_all(combo);
-        if hks.is_empty() {
-            log::warn!("无法解析快捷键「{combo}」");
-            return false;
+    pub fn set_locked(&self, locked: bool) {
+        self.shared.locked.store(locked, Ordering::Relaxed);
+    }
+    pub fn start_capture(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        if let Ok(mut slot) = self.shared.capture_tx.lock() {
+            *slot = Some(tx);
         }
-        let mut any_ok = false;
-        for hk in hks {
-            match self.mgr.register(hk) {
-                Ok(()) => {
-                    self.current.push(hk);
-                    if let Ok(mut a) = self.actions.lock() {
-                        a.insert(hk.id(), action.clone());
-                    }
-                    any_ok = true;
-                }
-                Err(e) => {
-                    log::warn!("注册快捷键「{combo}」失败（可能被其它程序占用）：{e}");
-                }
-            }
+        self.shared.capturing.store(true, Ordering::Relaxed);
+        self.capture_rx = Some(rx);
+    }
+    pub fn poll_capture(&self) -> Option<Option<(u8, u32)>> {
+        self.capture_rx.as_ref()?.try_recv().ok()
+    }
+    pub fn stop_capture(&self) {
+        self.shared.capturing.store(false, Ordering::Relaxed);
+        if let Ok(mut slot) = self.shared.capture_tx.lock() {
+            *slot = None;
         }
-        any_ok
+    }
+    pub fn is_capturing(&self) -> bool {
+        self.shared.capturing.load(Ordering::Relaxed)
     }
 }
-
-/// 在独立线程里阻塞监听热键事件，触发时回调 `on_action`。
-/// 不依赖 UI 刷帧，窗口被遮挡/最小化时也能响应。
-pub fn spawn_listener<F>(actions: SharedActions, on_action: F)
-where
-    F: Fn(HkAction) + Send + 'static,
-{
-    let _ = std::thread::Builder::new()
-        .name("hotkeys".into())
-        .spawn(move || {
-            let rx = GlobalHotKeyEvent::receiver();
-            while let Ok(ev) = rx.recv() {
-                if ev.state == HotKeyState::Pressed {
-                    let act = actions.lock().ok().and_then(|m| m.get(&ev.id).cloned());
-                    if let Some(a) = act {
-                        on_action(a);
+impl Drop for Hotkeys {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if let Some(m) = SHARED.get() {
+                if let Ok(mut g) = m.lock() {
+                    *g = None;
+                }
+            }
+        }
+    }
+}
+fn is_modifier_key(vk: u32) -> bool {
+    matches!(
+        vk,
+        VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU
+    )
+}
+#[cfg(windows)]
+mod win {
+   use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+   use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+        HHOOK, MSG, WH_KEYBOARD_LL,
+    };
+    // hook_callback 在父模块里用到这两个，所以 pub(super)
+    pub(super) use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, KBDLLHOOKSTRUCT,
+    };
+    pub(super) const HC_ACTION: i32 = 0;
+    pub(super) const WM_KEYDOWN: usize = 0x0100;
+    pub(super) const WM_KEYUP: usize = 0x0101;
+    pub(super) const WM_SYSKEYDOWN: usize = 0x0104;
+    pub(super) const WM_SYSKEYUP: usize = 0x0105;
+    pub(super) unsafe fn install_hook() -> Option<HHOOK> {
+        let hinst = GetModuleHandleW(std::ptr::null());
+        if hinst == 0 {
+            log::error!("GetModuleHandleW 失败");
+            return None;
+        }
+        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hinst, 0);
+        if hook == 0 {
+            log::error!("SetWindowsHookExW 失败");
+            return None;
+        }
+        Some(hook)
+    }
+    pub(super) unsafe fn run_message_loop() {
+        let mut msg: MSG = std::mem::zeroed();
+        loop {
+            let ret = GetMessageW(&mut msg, 0, 0, 0); // HWND=isize，传 0 = 线程全部窗口
+            if ret == 0 || ret == -1 {
+                break;
+            }
+        }
+    }
+    pub(super) unsafe fn remove_hook(hook: HHOOK) {
+        UnhookWindowsHookEx(hook);
+    }
+    pub(super) fn get_modifiers() -> u8 {
+        unsafe {
+            let mut mods = 0u8;
+            if GetAsyncKeyState(VK_LCONTROL as i32) < 0
+                || GetAsyncKeyState(VK_RCONTROL as i32) < 0
+            {
+                mods |= MOD_CTRL;
+            }
+            if GetAsyncKeyState(VK_LMENU as i32) < 0
+                || GetAsyncKeyState(VK_RMENU as i32) < 0
+            {
+                mods |= MOD_ALT;
+            }
+            if GetAsyncKeyState(VK_LSHIFT as i32) < 0
+                || GetAsyncKeyState(VK_RSHIFT as i32) < 0
+            {
+                mods |= MOD_SHIFT;
+            }
+            mods
+        }
+    }
+    unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
+        crate::hotkeys::hook_callback(code, wparam, lparam)
+    }
+}
+#[cfg(windows)]
+fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
+    if code == win::HC_ACTION {
+        let kb = unsafe { &*(lparam as *const win::KBDLLHOOKSTRUCT) };
+        let vk = kb.vkCode;
+        let is_down = wparam == win::WM_KEYDOWN || wparam == win::WM_SYSKEYDOWN;
+        let is_up = wparam == win::WM_KEYUP || wparam == win::WM_SYSKEYUP;
+        if is_down || is_up {
+            if let Some(shared) = shared_mutex().lock().ok().and_then(|g| g.clone()) {
+                if shared.capturing.load(Ordering::Relaxed) {
+                    if is_down && !is_modifier_key(vk) {
+                        let result = if vk == VK_ESCAPE { None } else { Some((win::get_modifiers(), vk)) };
+                        shared.capturing.store(false, Ordering::Relaxed);
+                        if let Ok(slot) = shared.capture_tx.lock() {
+                            if let Some(tx) = slot.as_ref() { let _ = tx.send(result); }
+                        }
+                    }
+                } else {
+                    let mods = win::get_modifiers();
+                    let key = combo_key(mods, vk);
+                    if is_down {
+                        let already_down = DOWN_KEYS.with(|dk| {
+                            let mut dk = dk.borrow_mut();
+                            let was = dk.contains(&key);
+                            dk.insert(key);
+                            was
+                        });
+                        if !already_down && !shared.locked.load(Ordering::Relaxed) {
+                            let action = shared.actions.lock().ok().and_then(|m| m.get(&key).cloned());
+                            if let Some(act) = action { (shared.on_action)(act); }
+                        }
+                    } else if is_up {
+                        DOWN_KEYS.with(|dk| { dk.borrow_mut().remove(&key); });
                     }
                 }
             }
-        });
+        }
+    }
+    unsafe { win::CallNextHookEx(0, code, wparam, lparam) }
 }
+#[cfg(windows)]
+thread_local! {
+    static DOWN_KEYS: std::cell::RefCell<HashSet<u32>> = std::cell::RefCell::new(HashSet::new());
+}
+#[cfg(windows)]
+fn hook_thread(shared: Arc<HookShared>) {
+    {
+        let mut g = shared_mutex().lock().unwrap();
+        *g = Some(shared);
+    }
+    unsafe {
+        let hook = match win::install_hook() {
+            Some(h) => h,
+            None => {
+                let mut g = shared_mutex().lock().unwrap();
+                *g = None;
+                return;
+            }
+        };
+        log::info!("低级键盘钩子已安装");
+        win::run_message_loop();
+        win::remove_hook(hook);
+        log::info!("低级键盘钩子已卸载");
+    }
+    let mut g = shared_mutex().lock().unwrap();
+    *g = None;
+}
+#[cfg(not(windows))]
+fn hook_thread(_shared: Arc<HookShared>) {}

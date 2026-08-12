@@ -52,7 +52,7 @@ fn is_audio(path: &Path) -> bool {
 }
 
 /// 列出所有 profile 名（profiles 下的子文件夹）。若一个都没有，创建「默认」。
-pub fn list_profiles() -> Vec<String> {
+pub fn list_profiles(default_name: &str) -> Vec<String> {
     let dir = crate::config::profiles_dir();
     let _ = std::fs::create_dir_all(&dir);
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -64,8 +64,8 @@ pub fn list_profiles() -> Vec<String> {
         })
         .unwrap_or_default();
     if names.is_empty() {
-        let _ = std::fs::create_dir_all(dir.join("默认"));
-        names.push("默认".to_string());
+        let _ = std::fs::create_dir_all(dir.join(default_name));
+        names.push(default_name.to_string());
     }
     names.sort();
     names

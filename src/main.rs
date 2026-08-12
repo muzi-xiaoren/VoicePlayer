@@ -5,6 +5,7 @@ mod app;
 mod audio;
 mod config;
 mod hotkeys;
+mod i18n;
 mod platform;
 mod profile;
 
@@ -15,12 +16,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 640.0])
             .with_min_inner_size([380.0, 460.0])
-            .with_title("VociePlayer"),
+            .with_title("VoicePlayer"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "VociePlayer",
+        "VoicePlayer",
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)) as Box<dyn eframe::App>)),
     )

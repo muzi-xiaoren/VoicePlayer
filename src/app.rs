@@ -1,33 +1,25 @@
-//! egui 界面 + 状态管理，把配置、音频线程、热键、profile 串起来。
-//!
-//! 音频跑在独立线程（见 `audio::spawn`），热键监听也在独立线程
-//! （见 `hotkeys::spawn_listener`），UI 只负责发命令 —— 窗口被游戏
-//! 遮挡、最小化时播放照常工作。
-
+﻿//! egui 界面 + 状态管理，把配置、音频线程、热键、profile、i18n 串起来。
 use crate::audio::{self, AudioCmd, AudioCtl};
 use crate::config::{AppConfig, RepeatMode};
 use crate::hotkeys::{self, HkAction, Hotkeys};
+use crate::i18n;
 use crate::platform;
 use crate::profile::{self, Profile, Sound};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
 /// 正在为「谁」捕获快捷键。
 #[derive(Clone, Copy, PartialEq)]
 enum CaptureTarget {
     Sound(usize),
     Stop,
 }
-
-/// UI 一帧里收集下来、帧末统一处理的动作（避免边遍历边改状态的借用冲突）。
+/// UI 一帧里收集下来、帧末统一处理的动作。
 #[derive(Default)]
 struct Pending {
     rebuild_engine: bool,
     switch_profile: Option<String>,
     new_profile: Option<String>,
-    /// 弹出「选择文件夹」原生对话框，把选中的文件夹加成外部配置。
     pick_folder: bool,
-    /// 移除一个外部文件夹配置（不删文件）。
     remove_external: Option<String>,
     play: Vec<usize>,
     capture: Option<CaptureTarget>,
@@ -36,8 +28,9 @@ struct Pending {
     set_volume: Vec<(usize, f32)>,
     open_folder: bool,
     reregister: bool,
+    lock_toggled: bool,
+    lang_changed: bool,
 }
-
 pub struct App {
     config: AppConfig,
     audio: AudioCtl,
@@ -51,24 +44,21 @@ pub struct App {
     new_profile_name: String,
     last_scan: Instant,
     last_signature: Vec<String>,
+    lang: i18n::Lang,
 }
-
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_fonts(&cc.egui_ctx);
-
         let mut config = AppConfig::load();
+        let lang = i18n::resolve_lang(&config.language);
+        let texts = i18n::Texts::new(lang);
         let out_devices = audio::output_devices();
         let in_devices = audio::input_devices();
         let vbcable = audio::vbcable_installed();
-
-        // 首次运行、还没选输出设备时，自动选中 VB-CABLE。
         if config.output_device.is_none() {
             config.output_device = audio::guess_cable_output();
         }
-
-        // 确定当前 profile（内置 + 外部文件夹都算）。
-        let profiles = Self::all_profiles(&config);
+        let profiles = Self::all_profiles(&config, texts.default_profile);
         let active = config
             .active_profile
             .clone()
@@ -82,26 +72,19 @@ impl App {
             .as_ref()
             .map(|p| Profile::file_signature(&p.dir))
             .unwrap_or_default();
-
-        // 音频线程
         let audio = audio::spawn(config.clone());
-
-        // 全局热键：manager 在主线程建；事件监听放独立线程，直接驱动音频线程。
-        let hotkeys = match Hotkeys::new() {
-            Ok(h) => Some(h),
-            Err(e) => {
-                log::error!("初始化全局热键失败：{e}");
-                None
-            }
-        };
-        if let Some(hk) = &hotkeys {
+        // 全局热键：用低级键盘钩子，回调直接驱动音频线程。
+        let hotkeys = {
             let audio2 = audio.clone();
-            hotkeys::spawn_listener(hk.actions_handle(), move |a| match a {
+            Hotkeys::new(move |action| match action {
                 HkAction::Play { path, volume } => audio2.send(AudioCmd::Play { path, volume }),
                 HkAction::StopAll => audio2.send(AudioCmd::StopAll),
-            });
+            })
+            .ok()
+        };
+        if let Some(hk) = &hotkeys {
+            hk.set_locked(config.locked);
         }
-
         let mut app = Self {
             config,
             audio,
@@ -115,15 +98,17 @@ impl App {
             new_profile_name: String::new(),
             last_scan: Instant::now(),
             last_signature,
+            lang,
         };
         app.config.save();
         app.reregister_hotkeys();
         app
     }
-
-    /// 全部 profile 名：profiles 目录下的子文件夹 + 配置里记的外部文件夹。
-    fn all_profiles(cfg: &AppConfig) -> Vec<String> {
-        let mut names = profile::list_profiles();
+    fn texts(&self) -> &'static i18n::Texts {
+        i18n::Texts::new(self.lang)
+    }
+    fn all_profiles(cfg: &AppConfig, default_name: &str) -> Vec<String> {
+        let mut names = profile::list_profiles(default_name);
         for n in cfg.external_profiles.keys() {
             if !names.contains(n) {
                 names.push(n.clone());
@@ -132,46 +117,37 @@ impl App {
         names.sort();
         names
     }
-
-    /// profile 名 -> 实际文件夹（外部配置优先）。
     fn dir_for_config(cfg: &AppConfig, name: &str) -> PathBuf {
         cfg.external_profiles
             .get(name)
             .cloned()
             .unwrap_or_else(|| crate::config::profiles_dir().join(name))
     }
-
     fn dir_for(&self, name: &str) -> PathBuf {
         Self::dir_for_config(&self.config, name)
     }
-
     fn rebuild_engine(&mut self) {
         self.audio.send(AudioCmd::Rebuild(self.config.clone()));
     }
-
+    /// 整体重建热键绑定表。每次 profile 切换 / 快捷键变更 / 音量调整后调用。
     fn reregister_hotkeys(&mut self) {
-        let Some(hk) = self.hotkeys.as_mut() else {
-            return;
-        };
-        hk.clear();
+        let Some(hk) = self.hotkeys.as_ref() else { return };
+        let mut bindings: Vec<(String, HkAction)> = Vec::new();
         if let Some(p) = &self.profile {
             for s in &p.sounds {
                 if let Some(combo) = &s.hotkey {
-                    hk.register(
-                        combo,
-                        HkAction::Play {
-                            path: s.path.clone(),
-                            volume: s.volume,
-                        },
-                    );
+                    bindings.push((
+                        combo.clone(),
+                        HkAction::Play { path: s.path.clone(), volume: s.volume },
+                    ));
                 }
             }
         }
         if let Some(stop) = &self.config.stop_hotkey {
-            hk.register(stop, HkAction::StopAll);
+            bindings.push((stop.clone(), HkAction::StopAll));
         }
+        hk.update_bindings(&bindings);
     }
-
     fn switch_profile(&mut self, name: &str) {
         self.config.active_profile = Some(name.to_string());
         let dir = self.dir_for(name);
@@ -181,10 +157,7 @@ impl App {
         self.config.save();
         self.reregister_hotkeys();
     }
-
-    /// 把任意文件夹加成一个外部配置并切过去。名字取文件夹名，重名自动加序号。
-    fn add_external_folder(&mut self, dir: PathBuf) {
-        // 同一个文件夹已经加过：直接切过去
+    fn add_external_folder(&mut self, dir: PathBuf, dialog_title: &str) {
         if let Some(name) = self
             .config
             .external_profiles
@@ -208,17 +181,14 @@ impl App {
         }
         self.config.external_profiles.insert(name.clone(), dir);
         self.config.save();
-        self.profiles = Self::all_profiles(&self.config);
+        self.profiles = Self::all_profiles(&self.config, self.texts().default_profile);
         self.switch_profile(&name);
     }
-
     fn refresh_devices(&mut self) {
         self.out_devices = audio::output_devices();
         self.in_devices = audio::input_devices();
         self.vbcable = audio::vbcable_installed();
     }
-
-    /// 每隔 ~1.5 秒轻量比对文件夹，检测到有音频增删就重载（实现「丢进去自动识别」）。
     fn maybe_rescan(&mut self) {
         if self.last_scan.elapsed() < Duration::from_millis(1500) {
             return;
@@ -234,36 +204,19 @@ impl App {
             }
         }
     }
-
-    /// 处理正在进行的快捷键捕获：读取本帧按键事件。
-    fn handle_capture(&mut self, ctx: &egui::Context) {
+    /// 轮询钩子线程的捕获结果。
+    fn handle_capture(&mut self) {
         if self.capturing.is_none() {
             return;
         }
-        // 返回 Some(Some(combo))=捕获成功；Some(None)=Esc 取消；None=还没按。
-        let result = ctx.input(|i| {
-            for ev in &i.events {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = ev
-                {
-                    if *key == egui::Key::Escape {
-                        return Some(None);
-                    }
-                    if let Some(combo) = hotkeys::from_egui(modifiers, *key) {
-                        return Some(Some(combo));
-                    }
-                }
-            }
-            None
-        });
-
-        let Some(outcome) = result else { return };
+        let result = self.hotkeys.as_ref().and_then(|hk| hk.poll_capture());
+        let Some(capture_result) = result else { return };
         let target = self.capturing.take();
-        if let (Some(combo), Some(target)) = (outcome, target) {
+        if let Some(hk) = &self.hotkeys {
+            hk.stop_capture();
+        }
+        if let (Some((mods, vk)), Some(target)) = (capture_result, target) {
+            let combo = hotkeys::format_combo(mods, vk);
             match target {
                 CaptureTarget::Sound(i) => {
                     if let Some(p) = self.profile.as_mut() {
@@ -281,10 +234,9 @@ impl App {
             self.reregister_hotkeys();
         }
     }
-
     fn apply(&mut self, pending: Pending) {
+        let texts = self.texts();
         let mut need_reregister = pending.reregister;
-
         for (i, v) in pending.set_volume {
             if let Some(p) = self.profile.as_mut() {
                 if let Some(s) = p.sounds.get_mut(i) {
@@ -294,7 +246,6 @@ impl App {
             }
             need_reregister = true;
         }
-
         for i in pending.clear_hotkey {
             if let Some(p) = self.profile.as_mut() {
                 if let Some(s) = p.sounds.get_mut(i) {
@@ -304,13 +255,11 @@ impl App {
             }
             need_reregister = true;
         }
-
         if pending.clear_stop {
             self.config.stop_hotkey = None;
             self.config.save();
             need_reregister = true;
         }
-
         for i in pending.play {
             if let Some(p) = &self.profile {
                 if let Some(s) = p.sounds.get(i) {
@@ -321,52 +270,54 @@ impl App {
                 }
             }
         }
-
         if pending.open_folder {
             if let Some(p) = &self.profile {
                 platform::open_folder(&p.dir);
             }
         }
-
         if let Some(t) = pending.capture {
             self.capturing = Some(t);
+            if let Some(hk) = self.hotkeys.as_mut() {
+                hk.start_capture();
+            }
         }
-
-        // 「新建配置」：普通名字 = profiles 下新建子文件夹；
-        // 粘贴的是绝对路径 = 当成外部文件夹加进来。
+        if pending.lock_toggled {
+            if let Some(hk) = &self.hotkeys {
+                hk.set_locked(self.config.locked);
+            }
+            self.config.save();
+        }
+        if pending.lang_changed {
+            self.config.language = Some(self.lang.code().to_string());
+            self.config.save();
+        }
         if let Some(input) = pending.new_profile {
             let input = input.trim().to_string();
             if !input.is_empty() {
                 let p = PathBuf::from(&input);
                 if p.is_absolute() {
                     if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
-                        self.add_external_folder(p);
+                        self.add_external_folder(p, texts.select_folder_dialog_title);
                         self.new_profile_name.clear();
                     }
-                } else if !input.contains('/')
-                    && !input.contains('\\')
-                    && profile::create_profile(&input).is_ok()
-                {
-                    self.profiles = Self::all_profiles(&self.config);
+                } else if !input.contains('/') && !input.contains('\\') && profile::create_profile(&input).is_ok() {
+                    self.profiles = Self::all_profiles(&self.config, texts.default_profile);
                     self.switch_profile(&input);
                     self.new_profile_name.clear();
                 }
             }
         }
-
-        // 原生「选择文件夹」对话框（有确定按钮）。
         if pending.pick_folder {
             if let Some(dir) = rfd::FileDialog::new()
-                .set_title("选择音效文件夹")
+                .set_title(texts.select_folder_dialog_title)
                 .pick_folder()
             {
-                self.add_external_folder(dir);
+                self.add_external_folder(dir, texts.select_folder_dialog_title);
             }
         }
-
         if let Some(name) = pending.remove_external {
             self.config.external_profiles.remove(&name);
-            self.profiles = Self::all_profiles(&self.config);
+            self.profiles = Self::all_profiles(&self.config, texts.default_profile);
             if self.config.active_profile.as_deref() == Some(name.as_str()) {
                 if let Some(first) = self.profiles.first().cloned() {
                     self.switch_profile(&first);
@@ -380,20 +331,16 @@ impl App {
                 self.config.save();
             }
         }
-
         if let Some(name) = pending.switch_profile {
             self.switch_profile(&name);
         }
-
         if pending.rebuild_engine {
             self.rebuild_engine();
         }
-
         if need_reregister {
             self.reregister_hotkeys();
         }
     }
-
     fn ui_settings(
         &mut self,
         ui: &mut egui::Ui,
@@ -401,121 +348,100 @@ impl App {
         in_devices: &[String],
         pending: &mut Pending,
     ) {
-        ui.heading("VociePlayer");
+        let texts = self.texts();
+        // —— 顶部行：标题 + 锁定 + 语言 ——
+        ui.horizontal(|ui| {
+            ui.heading(texts.title);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 语言下拉
+                let mut lang_sel = self.lang;
+                egui::ComboBox::from_label(texts.language)
+                    .selected_text(self.lang.display())
+                    .show_ui(ui, |ui| {
+                        for l in i18n::Lang::all() {
+                            if ui.selectable_value(&mut lang_sel, l, l.display()).changed() && l != self.lang {
+                                self.lang = l;
+                                pending.lang_changed = true;
+                            }
+                       }
+                   });
+                ui.separator();
+                // 锁定按钮
+                let (lock_label, lock_tooltip) = if self.config.locked {
+                    (texts.lock, texts.lock_tooltip)
+                } else {
+                    (texts.unlock, texts.unlock_tooltip)
+                };
+                let prev = self.config.locked;
+                if ui.button(lock_label).on_hover_text(lock_tooltip).clicked() {
+                    self.config.locked = !self.config.locked;
+                }
+                if self.config.locked != prev {
+                    pending.lock_toggled = true;
+                }
+            });
+        });
         ui.add_space(4.0);
-
         // VB-CABLE 状态
         if self.vbcable {
-            ui.colored_label(egui::Color32::from_rgb(60, 170, 90), "✔ 已检测到 VB-CABLE");
+            ui.colored_label(egui::Color32::from_rgb(60, 170, 90), texts.vbcable_detected);
         } else {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 120, 40),
-                "⚠ 未检测到 VB-CABLE（游戏里听不到音效）",
-            );
+            ui.colored_label(egui::Color32::from_rgb(200, 120, 40), texts.vbcable_not_detected);
             ui.horizontal(|ui| {
-                if ui.button("打开 VB-CABLE 下载页").clicked() {
+                if ui.button(texts.open_vbcable_url).clicked() {
                     platform::open_url(platform::VBCABLE_URL);
                 }
-                if ui.button("我装好了，重新检测").clicked() {
+                if ui.button(texts.reinstall_detect).clicked() {
                     self.refresh_devices();
                     pending.rebuild_engine = true;
                 }
             });
         }
         ui.separator();
-
-        // —— 设备选择 ——
-        device_combo(
-            ui,
-            "输出设备（选 CABLE Input）",
-            &mut self.config.output_device,
-            out_devices,
-            "系统默认",
-            &mut pending.rebuild_engine,
-        );
-        device_combo(
-            ui,
-            "麦克风",
-            &mut self.config.input_device,
-            in_devices,
-            "系统默认",
-            &mut pending.rebuild_engine,
-        );
-        device_combo(
-            ui,
-            "监听设备（可选，让自己也能听到）",
-            &mut self.config.monitor_device,
-            out_devices,
-            "不监听",
-            &mut pending.rebuild_engine,
-        );
+        device_combo(ui, texts.output_device, &mut self.config.output_device, out_devices, texts.system_default, &mut pending.rebuild_engine);
+        device_combo(ui, texts.microphone, &mut self.config.input_device, in_devices, texts.system_default, &mut pending.rebuild_engine);
+        device_combo(ui, texts.monitor_device, &mut self.config.monitor_device, out_devices, texts.no_monitor, &mut pending.rebuild_engine);
         if pending.rebuild_engine {
             self.config.save();
         }
-
         ui.separator();
-
-        // —— 麦克风转发开关 ——
-        if ui
-            .checkbox(&mut self.config.mic_passthrough, "转发麦克风（边说话边放音效）")
-            .changed()
-        {
-            self.audio
-                .send(AudioCmd::SetMicPassthrough(self.config.mic_passthrough));
+        if ui.checkbox(&mut self.config.mic_passthrough, texts.mic_passthrough).changed() {
+            self.audio.send(AudioCmd::SetMicPassthrough(self.config.mic_passthrough));
             self.config.save();
         }
-
-        // —— 音效音量 ——
         ui.horizontal(|ui| {
-            ui.label("音效音量");
+            ui.label(texts.effect_volume);
             let resp = ui.add(egui::Slider::new(&mut self.config.effect_volume, 0.0..=1.5));
             if resp.changed() {
-                self.audio
-                    .send(AudioCmd::SetEffectVolume(self.config.effect_volume));
+                self.audio.send(AudioCmd::SetEffectVolume(self.config.effect_volume));
                 self.config.save();
             }
         });
-
-        // —— 重复按键行为 ——
         ui.horizontal(|ui| {
-            ui.label("重复按同一键：");
+            ui.label(texts.repeat_behavior);
             let mut changed = false;
-            changed |= ui
-                .selectable_value(&mut self.config.repeat_mode, RepeatMode::Restart, "从头重播")
-                .clicked();
-            changed |= ui
-                .selectable_value(&mut self.config.repeat_mode, RepeatMode::Overlap, "叠加再播")
-                .clicked();
-            changed |= ui
-                .selectable_value(&mut self.config.repeat_mode, RepeatMode::Toggle, "一按播 / 再按停")
-                .clicked();
+            changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Restart, texts.repeat_restart).clicked();
+            changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Overlap, texts.repeat_overlap).clicked();
+            changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Toggle, texts.repeat_toggle).clicked();
             if changed {
                 self.audio.send(AudioCmd::SetRepeatMode(self.config.repeat_mode));
                 self.config.save();
             }
         });
-
-        // —— 开机自启 ——
-        if ui
-            .checkbox(&mut self.config.autostart, "开机自启动")
-            .changed()
-        {
+        if ui.checkbox(&mut self.config.autostart, texts.autostart).changed() {
             if let Err(e) = platform::set_autostart(self.config.autostart) {
                 log::error!("设置开机自启失败：{e}");
             }
             self.config.save();
         }
-
-        // —— 引擎错误 ——
         if let Some(err) = self.audio.last_error() {
             ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(210, 70, 70), format!("音频引擎错误：{err}"));
-            if ui.button("重试").clicked() {
+            ui.colored_label(egui::Color32::from_rgb(210, 70, 70), format!("{}{err}", texts.audio_engine_error));
+            if ui.button(texts.retry).clicked() {
                 pending.rebuild_engine = true;
             }
         }
     }
-
     fn ui_sounds(
         &mut self,
         ui: &mut egui::Ui,
@@ -523,14 +449,10 @@ impl App {
         sounds: &[Sound],
         pending: &mut Pending,
     ) {
-        // —— profile 选择 / 新建 ——
+        let texts = self.texts();
         ui.horizontal(|ui| {
-            let cur = self
-                .config
-                .active_profile
-                .clone()
-                .unwrap_or_else(|| "（无）".to_string());
-            egui::ComboBox::from_label("配置")
+            let cur = self.config.active_profile.clone().unwrap_or_else(|| texts.none_label.to_string());
+            egui::ComboBox::from_label(texts.profile)
                 .selected_text(cur)
                 .show_ui(ui, |ui| {
                     for name in profiles {
@@ -545,95 +467,71 @@ impl App {
                         }
                     }
                 });
-            if ui.button("📂 打开文件夹").clicked() {
+            if ui.button(texts.open_folder).clicked() {
                 pending.open_folder = true;
             }
-            // 外部文件夹配置可以移除（只解除关联，不删文件）
-            let is_external = self
-                .config
-                .active_profile
-                .as_ref()
-                .map(|n| self.config.external_profiles.contains_key(n))
-                .unwrap_or(false);
-            if is_external
-                && ui
-                    .button("✖ 移除")
-                    .on_hover_text("从列表移除这个外部文件夹（不删除文件）")
-                    .clicked()
-            {
+            let is_external = self.config.active_profile.as_ref().map(|n| self.config.external_profiles.contains_key(n)).unwrap_or(false);
+            if is_external && ui.button(texts.remove).on_hover_text(texts.remove_tooltip).clicked() {
                 pending.remove_external = self.config.active_profile.clone();
             }
         });
         ui.horizontal(|ui| {
-            ui.label("新建配置：");
-            ui.text_edit_singleline(&mut self.new_profile_name)
-                .on_hover_text("输入名字新建；也可以直接粘贴一个文件夹的完整路径");
-            if ui.button("新建").clicked() {
+            ui.label(texts.new_profile);
+            ui.text_edit_singleline(&mut self.new_profile_name).on_hover_text(texts.new_profile_placeholder);
+            if ui.button(texts.create).clicked() {
                 pending.new_profile = Some(self.new_profile_name.clone());
             }
-            if ui
-                .button("📁 选择文件夹…")
-                .on_hover_text("把电脑上任意一个装音效的文件夹加成配置")
-                .clicked()
-            {
+            if ui.button(texts.select_folder).on_hover_text(texts.select_folder_tooltip).clicked() {
                 pending.pick_folder = true;
             }
         });
-
-        // —— 停止键 ——
         ui.horizontal(|ui| {
-            let label = self
-                .config
-                .stop_hotkey
-                .clone()
-                .unwrap_or_else(|| "未设置".to_string());
-            ui.label(format!("停止所有音效：{label}"));
-            if ui.button("设置快捷键").clicked() {
+            let label = self.config.stop_hotkey.as_ref().map(|h| hotkeys::pretty_combo(h)).unwrap_or_else(|| texts.stop_all_not_set.to_string());
+            ui.label(format!("{}{label}", texts.stop_all));
+            if ui.button(texts.set_hotkey).clicked() {
                 pending.capture = Some(CaptureTarget::Stop);
             }
-            if self.config.stop_hotkey.is_some() && ui.button("清除").clicked() {
+            if self.config.stop_hotkey.is_some() && ui.button(texts.clear).clicked() {
                 pending.clear_stop = true;
             }
         });
-
         ui.separator();
-
         if sounds.is_empty() {
-            ui.label("这个配置还没有音频。点「打开文件夹」把 mp3 / wav 拖进去，会自动出现在这里。");
+            ui.label(texts.empty_hint);
             return;
         }
-
-        // —— 音效列表 ——
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, s) in sounds.iter().enumerate() {
-                ui.horizontal(|ui| {
+               ui.horizontal(|ui| {
                     if ui.button("▶").clicked() {
                         pending.play.push(i);
                     }
-                    ui.label(&s.name);
-
-                    // 右侧对齐放快捷键 / 音量控制
+                    // 文件名用截断显示，确保右侧控件始终可见不被挤出。
+                    // 先预留控件区域宽度，再让 label 用剩余空间。
+                    let controls_min = 300.0;
+                    let avail = ui.available_width();
+                    let label_max = (avail - controls_min).max(avail * 0.3).min(avail - 80.0);
+                    ui.add(
+                        egui::Label::new(&s.name)
+                            .wrap_mode(egui::TextWrapMode::Truncate)
+                            .max_width(label_max),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // 单独音量
                         let mut v = s.volume;
                         let resp = ui.add(
-                            egui::Slider::new(&mut v, 0.0..=1.5)
-                                .show_value(false)
-                                .fixed_decimals(1),
+                            egui::Slider::new(&mut v, 0.0..=1.5).show_value(false).fixed_decimals(1),
                         );
                         if resp.changed() {
                             pending.set_volume.push((i, v));
                         }
-
-                        // 快捷键
                         let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
                         if s.hotkey.is_some() && ui.button("✖").clicked() {
                             pending.clear_hotkey.push(i);
                         }
                         let btn_label = if capturing_this {
-                            "按下快捷键…（Esc 取消）".to_string()
+                            texts.capturing_cancel.to_string()
                         } else {
-                            s.hotkey.clone().unwrap_or_else(|| "设快捷键".to_string())
+                            s.hotkey.as_ref().map(|h| hotkeys::pretty_combo(h)).unwrap_or_else(|| texts.set_hotkey_short.to_string())
                         };
                         if ui.button(btn_label).clicked() && !capturing_this {
                             pending.capture = Some(CaptureTarget::Sound(i));
@@ -644,40 +542,25 @@ impl App {
         });
     }
 }
-
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 热键和播放都在独立线程，这里的定时刷帧只为文件夹自动重扫。
         ctx.request_repaint_after(Duration::from_millis(500));
-
-        // 1) 文件夹自动重扫
         self.maybe_rescan();
-
-        // 2) 快捷键捕获
-        self.handle_capture(ctx);
-
-        // 3) 界面（设备/profile 列表先克隆成局部，避开借用冲突）
+        self.handle_capture();
         let out_devices = self.out_devices.clone();
         let in_devices = self.in_devices.clone();
         let profiles = self.profiles.clone();
         let sounds = self.profile.as_ref().map(|p| p.sounds.clone()).unwrap_or_default();
         let mut pending = Pending::default();
-
-        egui::TopBottomPanel::top("settings")
-            .resizable(false)
-            .show(ctx, |ui| {
-                self.ui_settings(ui, &out_devices, &in_devices, &mut pending);
-            });
+        egui::TopBottomPanel::top("settings").resizable(false).show(ctx, |ui| {
+            self.ui_settings(ui, &out_devices, &in_devices, &mut pending);
+        });
         egui::CentralPanel::default().show(ctx, |ui| {
             self.ui_sounds(ui, &profiles, &sounds, &mut pending);
         });
-
-        // 4) 帧末统一处理
         self.apply(pending);
     }
 }
-
-/// 一个「选择设备」下拉框。选择变化时把 `changed` 置 true。
 fn device_combo(
     ui: &mut egui::Ui,
     label: &str,
@@ -702,31 +585,19 @@ fn device_combo(
             }
         });
 }
-
-/// 加载中文字体（否则中文界面全是方块）。优先 Windows 黑体，其次 Mac 苹方。
 fn install_cjk_fonts(ctx: &egui::Context) {
     let candidates = [
-        "C:/Windows/Fonts/msyh.ttc",   // 微软雅黑
-        "C:/Windows/Fonts/simhei.ttf", // 黑体
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
     ];
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
             let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "cjk".to_owned());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push("cjk".to_owned());
+            fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
+            fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "cjk".to_owned());
+            fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk".to_owned());
             ctx.set_fonts(fonts);
             return;
         }

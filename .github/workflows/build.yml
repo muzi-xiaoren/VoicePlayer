@@ -1,4 +1,4 @@
-name: Build Windows
+﻿name: Build Windows
 
 # push 到 main / 手动触发：构建并上传可下载 artifact。
 # 推 v 开头的 tag（如 v0.0.1）：额外把绿色版 zip + 安装包发到 Release。
@@ -32,8 +32,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/vocieplayer.exe dist/VociePlayer.exe
-          Compress-Archive -Path dist/VociePlayer.exe -DestinationPath VociePlayer-Windows.zip -Force
+          Copy-Item target/release/voiceplayer.exe dist/VoicePlayer.exe
+          Compress-Archive -Path dist/VoicePlayer.exe -DestinationPath VoicePlayer-Windows.zip -Force
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
@@ -45,39 +45,39 @@ jobs:
           $iss = @"
           [Setup]
           AppId={{B7F2C1A4-9D3E-4C6B-8A15-3E9D2C1A4F60}
-          AppName=VociePlayer
+          AppName=VoicePlayer
           AppVersion=$version
           AppPublisher=muzi-xiaoren
-          DefaultDirName={autopf}\VociePlayer
-          DefaultGroupName=VociePlayer
+          DefaultDirName={autopf}\VoicePlayer
+          DefaultGroupName=VoicePlayer
           OutputDir=$env:GITHUB_WORKSPACE
-          OutputBaseFilename=VociePlayer-Setup
+          OutputBaseFilename=VoicePlayer-Setup
           Compression=lzma
           SolidCompression=yes
           WizardStyle=modern
 
           [Files]
-          Source: "$env:GITHUB_WORKSPACE\target\release\vocieplayer.exe"; DestDir: "{app}"; DestName: "VociePlayer.exe"; Flags: ignoreversion
+          Source: "$env:GITHUB_WORKSPACE\target\release\voiceplayer.exe"; DestDir: "{app}"; DestName: "VoicePlayer.exe"; Flags: ignoreversion
 
           [Icons]
-          Name: "{group}\VociePlayer"; Filename: "{app}\VociePlayer.exe"
-          Name: "{autodesktop}\VociePlayer"; Filename: "{app}\VociePlayer.exe"; Tasks: desktopicon
+          Name: "{group}\VoicePlayer"; Filename: "{app}\VoicePlayer.exe"
+          Name: "{autodesktop}\VoicePlayer"; Filename: "{app}\VoicePlayer.exe"; Tasks: desktopicon
 
           [Tasks]
           Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"; Flags: unchecked
 
           [Run]
-          Filename: "{app}\VociePlayer.exe"; Description: "启动 VociePlayer"; Flags: nowait postinstall skipifsilent
+          Filename: "{app}\VoicePlayer.exe"; Description: "启动 VoicePlayer"; Flags: nowait postinstall skipifsilent
           "@
           Set-Content -Path installer.iss -Value $iss -Encoding UTF8
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
 
       - uses: actions/upload-artifact@v4
         with:
-          name: VociePlayer-Windows
+          name: VoicePlayer-Windows
           path: |
-            VociePlayer-Windows.zip
-            VociePlayer-Setup.exe
+            VoicePlayer-Windows.zip
+            VoicePlayer-Setup.exe
           if-no-files-found: error
 
   release:
@@ -94,8 +94,8 @@ jobs:
       - name: Collect release files
         run: |
           mkdir -p release
-          cp artifacts/VociePlayer-Windows/VociePlayer-Windows.zip release/
-          cp artifacts/VociePlayer-Windows/VociePlayer-Setup.exe   release/
+          cp artifacts/VoicePlayer-Windows/VoicePlayer-Windows.zip release/
+          cp artifacts/VoicePlayer-Windows/VoicePlayer-Setup.exe   release/
           ls -lh release
 
       - name: Publish to GitHub Releases
@@ -108,12 +108,12 @@ jobs:
 
             | 文件 | 说明 |
             |---|---|
-            | **VociePlayer-Setup.exe** | 推荐，安装版 |
-            | VociePlayer-Windows.zip | 免安装绿色版，解压即用 |
+            | **VoicePlayer-Setup.exe** | 推荐，安装版 |
+            | VoicePlayer-Windows.zip | 免安装绿色版，解压即用 |
 
             ## 🔧 首次使用
             1. 先装 [VB-CABLE](https://vb-audio.com/Cable/)（免费虚拟声卡）并重启。
-            2. 打开 VociePlayer，输出设备选 **CABLE Input**。
+            2. 打开 VoicePlayer，输出设备选 **CABLE Input**。
             3. 在游戏 / Discord 里把麦克风设成 **CABLE Output**。
             4. 把音频拖进配置文件夹、绑定快捷键即可。
 

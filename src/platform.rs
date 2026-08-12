@@ -12,7 +12,7 @@ pub fn set_autostart(enable: bool) -> anyhow::Result<()> {
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (run, _) = hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")?;
-    const NAME: &str = "VociePlayer";
+    const NAME: &str = "VoicePlayer";
     if enable {
         let exe = std::env::current_exe()?;
         run.set_value(NAME, &format!("\"{}\"", exe.display()))?;

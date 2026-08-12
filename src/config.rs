@@ -1,8 +1,8 @@
-//! 全局配置与数据目录。
+﻿//! 全局配置与数据目录。
 //!
-//! 数据都放在系统的 AppData 目录下（Windows: `%APPDATA%\VociePlayer\`）：
+//! 数据都放在系统的 AppData 目录下（Windows: `%APPDATA%\VoicePlayer\`）：
 //! ```text
-//! %APPDATA%\VociePlayer\
+//! %APPDATA%\VoicePlayer\
 //! ├─ config.json        # 本文件对应的全局配置
 //! └─ profiles\          # 每个子文件夹 = 一个配置（profile）
 //!    └─ 默认\
@@ -26,9 +26,9 @@ pub enum RepeatMode {
     Toggle,
 }
 
-/// 数据根目录：`%APPDATA%\VociePlayer\`（拿不到时退回当前目录）。
+/// 数据根目录：`%APPDATA%\VoicePlayer\`（拿不到时退回当前目录）。
 pub fn data_root() -> PathBuf {
-    directories::ProjectDirs::from("com", "muzi", "VociePlayer")
+    directories::ProjectDirs::from("com", "muzi", "VoicePlayer")
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
 }
@@ -65,6 +65,10 @@ pub struct AppConfig {
     pub external_profiles: BTreeMap<String, PathBuf>,
     /// 开机自启（仅 Windows 生效）。
     pub autostart: bool,
+    /// 语言设置。None = 跟随系统语言。
+    pub language: Option<String>,
+    /// 锁定快捷键。锁定后按快捷键不会触发任何音效。
+    pub locked: bool,
 }
 
 impl Default for AppConfig {
@@ -80,6 +84,8 @@ impl Default for AppConfig {
             repeat_mode: RepeatMode::default(),
             external_profiles: BTreeMap::new(),
             autostart: false,
+            language: None,
+            locked: false,
         }
     }
 }
