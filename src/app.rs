@@ -571,14 +571,18 @@ impl App {
                         },
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut v = s.volume;
-                        let resp = ui.add(
-                            egui::Slider::new(&mut v, 0.0..=1.5).show_value(false).fixed_decimals(1),
+                       let mut v = s.volume;
+                        let resp = ui.add_sized(
+                            [60.0, 16.0],
+                            egui::Slider::new(&mut v, 0.0..=1.5)
+                                .show_value(false)
+                                .fixed_decimals(1)
+                                .id_source(format!("vol_{i}")),
                         );
-                        if resp.changed() {
-                            pending.set_volume.push((i, v));
-                        }
-                        let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
+                       if resp.changed() {
+                           pending.set_volume.push((i, v));
+                       }
+                       let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
                         if s.hotkey.is_some() && ui.button("✖").clicked() {
                             pending.clear_hotkey.push(i);
                         }

@@ -1,8 +1,8 @@
-ï»¿[package]
+[package]
 name = "voiceplayer"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
-description = "è½»é‡çº§ Windows å£°å¡éŸ³æ•ˆçƒ­é”®å·¥å…·ï¼ˆç±» Soundpadï¼‰"
+description = "ÇáÁ¿¼¶ Windows Éù¿¨ÒôĞ§ÈÈ¼ü¹¤¾ß£¨Àà Soundpad£©"
 license = "MIT"
 repository = "https://github.com/muzi-xiaoren/VoicePlayer"
 
@@ -32,7 +32,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Registry",
 ] }
 
-# ä½“ç§¯ä¼˜å…ˆçš„ release é…ç½®ï¼šstrip + LTO + æœ€å°ä½“ç§¯ä¼˜åŒ–
+# Ìå»ıÓÅÏÈµÄ release ÅäÖÃ£ºstrip + LTO + ×îĞ¡Ìå»ıÓÅ»¯
 [profile.release]
 opt-level = "z"
 lto = true
