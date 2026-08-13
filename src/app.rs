@@ -572,12 +572,12 @@ impl App {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                        let mut v = s.volume;
-                       let resp = ui.add_sized(
-                           egui::vec2(60.0, 16.0),
+                        let resp = ui.add_sized(
+                            egui::vec2(60.0, 16.0),
                             egui::Slider::new(&mut v, 0.0..=1.5)
                                 .show_value(false)
                                 .fixed_decimals(1),
-                       );
+                        );
                        if resp.changed() {
                            pending.set_volume.push((i, v));
                        }
