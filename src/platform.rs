@@ -10,7 +10,7 @@ pub fn set_autostart(enable: bool) -> anyhow::Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW,
+        RegCloseKey, RegOpenKeyExW, RegDeleteValueW, RegSetValueExW,
         HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
     };
 
@@ -24,16 +24,12 @@ pub fn set_autostart(enable: bool) -> anyhow::Result<()> {
 
     unsafe {
         let mut hkey: HKEY = std::ptr::null_mut();
-        let status = RegCreateKeyExW(
+        let status = RegOpenKeyExW(
             HKEY_CURRENT_USER,
             subkey.as_ptr(),
             0,
-            std::ptr::null(),
-            0,
             KEY_SET_VALUE,
-            std::ptr::null(),
             &mut hkey,
-            std::ptr::null_mut(),
         );
         if status != 0 {
             anyhow::bail!("打开注册表项失败，错误码 {status}");
