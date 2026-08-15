@@ -654,17 +654,14 @@ impl eframe::App for App {
         });
        self.apply(pending);
         // Save window geometry every ~2 seconds so position/size persist across restarts.
-        if self.last_window_save.elapsed() >= Duration::from_secs(2) {
-            self.last_window_save = Instant::now();
-            let size = ctx.screen_rect().size();
-            let pos = ctx.input(|i| i.viewport().inner_rect.map(|r| r.min));
-            let new_w = Some(size.x);
-            let new_h = Some(size.y);
-            let (new_x, new_y) = match pos {
-                Some(p) => (Some(p.x), Some(p.y)),
-                None => (self.config.window_x, self.config.window_y),
-            };
-            if self.config.window_x != new_x || self.config.window_y != new_y
+       if self.last_window_save.elapsed() >= Duration::from_secs(2) {
+           self.last_window_save = Instant::now();
+           let size = ctx.screen_rect().size();
+           let new_w = Some(size.x);
+           let new_h = Some(size.y);
+            let new_x = Some(ctx.screen_rect().min.x);
+            let new_y = Some(ctx.screen_rect().min.y);
+           if self.config.window_x != new_x || self.config.window_y != new_y
                 || self.config.window_w != new_w || self.config.window_h != new_h
             {
                 self.config.window_x = new_x;
