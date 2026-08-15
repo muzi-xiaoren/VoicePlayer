@@ -503,12 +503,12 @@ impl App {
                 }
             });
         }
-        ui.add_space(2.0);
-        ui.label(
+       ui.add_space(2.0);
+        ui.add(
             egui::Label::new(egui::RichText::new(texts.loopback_hint).small().color(egui::Color32::from_gray(140)))
                 .wrap_mode(egui::TextWrapMode::Wrap),
         );
-        ui.separator();
+       ui.separator();
        if ui.checkbox(&mut self.config.autostart, texts.autostart).changed() {
             if let Err(e) = platform::set_autostart(self.config.autostart) {
                 log::error!("设置开机自启失败：{e}");
@@ -775,13 +775,13 @@ fn apply_dark_theme(ctx: &egui::Context) {
     v.window_fill = egui::Color32::from_rgb(28, 32, 44);
     v.extreme_bg_color = egui::Color32::from_rgb(14, 17, 24);
     v.selection.bg_fill = egui::Color32::from_rgb(56, 112, 200);
-    v.widget_noninteractive.bg_fill = egui::Color32::from_rgb(24, 27, 38);
-    v.widget_noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 155, 170));
-    v.widget_inactive.bg_fill = egui::Color32::from_rgb(36, 41, 56);
-    v.widget_inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 205, 220));
-    v.widget_hovered.bg_fill = egui::Color32::from_rgb(48, 55, 72);
-    v.widget_hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 235, 245));
-    v.widget_active.bg_fill = egui::Color32::from_rgb(56, 65, 88);
-    v.widget_active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 245, 255));
+    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 27, 38);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 155, 170));
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(36, 41, 56);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 205, 220));
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(48, 55, 72);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 235, 245));
+    v.widgets.active.bg_fill = egui::Color32::from_rgb(56, 65, 88);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 245, 255));
     ctx.set_visuals(v);
 }

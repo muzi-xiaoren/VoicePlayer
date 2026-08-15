@@ -258,17 +258,17 @@ mod ffi {
         if hr < 0 { CoUninitialize(); return Err(format!("CoCreateInstance 0x{hr:08X}")); }
 
         let mut device: *mut c_void = std::ptr::null_mut();
-        let hr = vtbl::<EnumVtbl>(enum_obj)
-            .get_default(enum_obj, E_RENDER, E_CONSOLE, &mut device);
+        let hr = (vtbl::<EnumVtbl>(enum_obj)
+            .get_default)(enum_obj, E_RENDER, E_CONSOLE, &mut device);
         if hr < 0 { release(enum_obj); CoUninitialize(); return Err(format!("GetDefault 0x{hr:08X}")); }
 
         let mut client: *mut c_void = std::ptr::null_mut();
-        let hr = vtbl::<DeviceVtbl>(device)
-            .activate(device, &IID_AUDIO_CLIENT, CLSCTX_ALL, std::ptr::null(), &mut client);
+        let hr = (vtbl::<DeviceVtbl>(device)
+            .activate)(device, &IID_AUDIO_CLIENT, CLSCTX_ALL, std::ptr::null(), &mut client);
         if hr < 0 { release(device); release(enum_obj); CoUninitialize(); return Err(format!("Activate 0x{hr:08X}")); }
 
         let mut mix: *mut WaveFormatEx = std::ptr::null_mut();
-        let hr = vtbl::<ClientVtbl>(client).get_mix_format(client, &mut mix);
+        let hr = (vtbl::<ClientVtbl>(client).get_mix_format)(client, &mut mix);
         if hr < 0 || mix.is_null() {
             release(client); release(device); release(enum_obj); CoUninitialize();
             return Err(format!("GetMixFormat 0x{hr:08X}"));
@@ -285,7 +285,7 @@ mod ffi {
 
         let _ = buf.sample_rate.set(sample_rate);
 
-        let hr = vtbl::<ClientVtbl>(client).initialize(
+        let hr = (vtbl::<ClientVtbl>(client).initialize)(
             client, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
             0, 0, std::ptr::null(), std::ptr::null(),
         );
@@ -296,14 +296,14 @@ mod ffi {
         }
 
         let mut capture: *mut c_void = std::ptr::null_mut();
-        let hr = vtbl::<ClientVtbl>(client).get_service(client, &IID_CAPTURE, &mut capture);
+        let hr = (vtbl::<ClientVtbl>(client).get_service)(client, &IID_CAPTURE, &mut capture);
         if hr < 0 {
             CoTaskMemFree(mix as *const c_void);
             release(client); release(device); release(enum_obj); CoUninitialize();
             return Err(format!("GetService 0x{hr:08X}"));
         }
 
-        let hr = vtbl::<ClientVtbl>(client).start(client);
+        let hr = (vtbl::<ClientVtbl>(client).start)(client);
         if hr < 0 {
             CoTaskMemFree(mix as *const c_void);
             release(capture); release(client); release(device); release(enum_obj); CoUninitialize();
@@ -312,12 +312,12 @@ mod ffi {
 
         while !stop.load(Ordering::Relaxed) {
             let mut packet: u32 = 0;
-            if vtbl::<CaptureVtbl>(capture).get_next_packet(capture, &mut packet) < 0 { break; }
+            if (vtbl::<CaptureVtbl>(capture).get_next_packet)(capture, &mut packet) < 0 { break; }
             while packet > 0 {
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let mut frames: u32 = 0;
                 let mut flags: u32 = 0;
-                let hr = vtbl::<CaptureVtbl>(capture).get_buffer(
+                let hr = (vtbl::<CaptureVtbl>(capture).get_buffer)(
                     capture, &mut data, &mut frames, &mut flags,
                     std::ptr::null_mut(), std::ptr::null_mut(),
                 );
@@ -330,13 +330,13 @@ mod ffi {
                         frames as usize, channels, bits, is_float, buf,
                     );
                 }
-                vtbl::<CaptureVtbl>(capture).release_buffer(capture, frames);
-                let _ = vtbl::<CaptureVtbl>(capture).get_next_packet(capture, &mut packet);
+                (vtbl::<CaptureVtbl>(capture).release_buffer)(capture, frames);
+                let _ = (vtbl::<CaptureVtbl>(capture).get_next_packet)(capture, &mut packet);
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        vtbl::<ClientVtbl>(client).stop(client);
+        (vtbl::<ClientVtbl>(client).stop)(client);
         CoTaskMemFree(mix as *const c_void);
         release(capture);
         release(client);

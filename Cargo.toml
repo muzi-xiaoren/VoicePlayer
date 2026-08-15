@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "voiceplayer"
 version = "0.0.5"
 edition = "2021"
