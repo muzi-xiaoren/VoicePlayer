@@ -1,4 +1,4 @@
-﻿﻿# VoicePlayer
+# VoicePlayer
 
 English | [中文](./README.md)
 
@@ -6,19 +6,20 @@ A lightweight Windows soundboard hotkey tool (similar to Soundpad). Press a glob
 hotkey to mix sound effects into your microphone so everyone in your game or voice
 chat can hear them — while **your normal speech is unaffected**.
 
-- Pure Rust + egui, single exe, small footprint, low memory, fast startup
-- Multiple profiles (each profile is a folder); drop audio files in and they auto-appear.
-  Any folder on your computer can also be added as a profile.
-- Bind a global hotkey per sound, plus a dedicated "stop all" hotkey
-- Main-row and numpad digit keys can be bound independently (no interference)
-- One-click lock: when locked, hotkeys won't trigger any sound — prevents accidental fire
-- Multi-language: Chinese / English, defaults to system language
-- Hotkeys use a low-level keyboard hook (WH_KEYBOARD_LL) that never blocks key events,
-  so a bound key still types normally
-- Hotkeys are monitored on a background thread — works in fullscreen games and when minimized
-- Multiple sounds mix simultaneously; repeated key behavior is configurable:
-  restart / overlap / toggle
-- Optional: autostart, headphone monitoring (hear effects yourself)
+## Features
+
+- **Multi-sound mixing**: multiple sounds play simultaneously without interfering
+- **Hotkey binding**: bind a global hotkey per sound, plus a dedicated "stop all" hotkey
+- **Main-row / numpad independent binding**: main-row 1 and numpad 1 can be bound to different sounds
+- **One-click lock**: when locked, hotkeys won't trigger any sound
+- **Non-blocking keys**: bound keys still type normally — no key swallowing
+- **Repeat key behavior**: restart / overlap / toggle
+- **System audio capture**: mix audio currently playing on your PC (music, video, etc.) into the virtual mic
+- **App audio routing**: route a specific app's audio (browser, music player, etc.) into the virtual mic
+- **Headphone monitoring**: hear effects yourself
+- **Multi-language**: Chinese / English, defaults to system language
+- **Autostart**: optionally launch on system startup
+- **Window position memory**: restores last window position and size on next launch
 
 ## How It Works
 
@@ -46,17 +47,44 @@ Since mixing happens inside the app, **you don't need VoiceMeeter** — just a s
 > forward your real mic. Closing the app means the game gets no mic audio.
 > Enable "Launch on startup" for convenience.
 
+## System Audio Capture (Two Methods)
+
+Want to send audio currently playing on your PC (music, video, etc.) into the game mic? There are two ways:
+
+### Method 1: System Audio Capture (all system sound)
+
+Best for mixing **all system audio** into the virtual mic at once.
+
+1. Open VoicePlayer, find the "System Audio Capture" section at the bottom
+2. Check **"Capture system audio to microphone"**
+3. Adjust the "Capture Volume" slider to control how loud the captured audio is
+4. Now any sound playing on your PC (music, video, game audio, etc.) will be mixed into the virtual mic
+
+> Note: This captures **all** system sound, including notification sounds. If you only want one app's audio, use Method 2 below.
+
+### Method 2: App Audio Routing (specific app)
+
+Best for sending only **one app's** audio into the virtual mic while leaving other apps unaffected.
+
+1. Open VoicePlayer, find the "App Audio Routing" section at the bottom
+2. Click **"Open app volume settings"** — Windows will open the Sound Settings → App Volume page
+3. Find the app you want to route (e.g., NetEase Cloud Music, Chrome browser, etc.)
+4. Change its **output device** to `CABLE Input (VB-Audio Virtual Cable)`
+5. Now only that app's audio goes to the virtual mic; other apps still play through your speakers normally
+
+> For example, if you set NetEase Cloud Music's output to CABLE Input, your teammates will hear your music; meanwhile your browser video audio still plays from your speakers as usual.
+
 ## Data Directory
 
 Config and audio live in `%APPDATA%\VoicePlayer\`:
 
 ```
 %APPDATA%\VoicePlayer\
-├─ config.json
+├─ config.json        # global config
 └─ profiles\
    └─ Default\
       ├─ xxx.mp3
-      └─ _bindings.json   # hotkey / volume bindings
+      └─ _bindings.json   # hotkey bindings
 ```
 
 ## Building from Source
@@ -68,7 +96,7 @@ cargo run            # debug run
 cargo build --release
 ```
 
-Releasing: push a `v`-prefixed tag (e.g. `v0.0.3`) and GitHub Actions will
+Releasing: push a `v`-prefixed tag (e.g., `v0.0.3`) and GitHub Actions will
 automatically build a portable zip + installer and publish to Releases.
 
 ## License
