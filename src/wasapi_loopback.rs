@@ -275,7 +275,7 @@ mod ffi {
         }
 
         let channels = (*mix).n_channels;
-        let sample_rate = (*mix).n_samples_per_sec;
+        let sample_rate = (*mix).samples_per_sec;
         let bits = (*mix).bits_per_sample;
         let tag = (*mix).format_tag;
         let is_float = tag == WAVE_FORMAT_IEEE_FLOAT
