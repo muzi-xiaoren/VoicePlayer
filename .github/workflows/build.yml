@@ -1,4 +1,4 @@
-﻿name: Build Windows
+name: Build Windows
 
 # push 到 main / 手动触发：构建并上传可下载 artifact。
 # 推 v 开头的 tag（如 v0.0.1）：额外把绿色版 zip + 安装包发到 Release。
