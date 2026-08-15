@@ -288,12 +288,17 @@ impl App {
         });
     }
     fn apply(&mut self, pending: Pending) {
-        let texts = self.texts();
+       let texts = self.texts();
         let mut need_reregister = pending.reregister;
         for (i, v) in pending.set_volume {
             if let Some(p) = self.profile.as_mut() {
                 if let Some(s) = p.sounds.get_mut(i) {
                     s.volume = v;
+                    // 即时更新正在播放的音轨音量（无需重新触发）
+                    self.audio.send(AudioCmd::SetSoundVolume {
+                        path: s.path.clone(),
+                        volume: v,
+                    });
                 }
                 p.save_bindings();
             }
@@ -601,18 +606,22 @@ impl App {
                             );
                         },
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                       let mut v = s.volume;
-                        let resp = ui.add_sized(
-                            egui::vec2(60.0, 16.0),
-                            egui::Slider::new(&mut v, 0.0..=1.5)
-                                .show_value(false)
-                                .fixed_decimals(1),
-                        );
-                       if resp.changed() {
-                           pending.set_volume.push((i, v));
-                       }
-                       let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
+                   ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut v = s.volume;
+                        let mut vol_changed: Option<f32> = None;
+                        ui.push_id(format!("vol_slider_{i}"), |ui| {
+                            let resp = ui.add_sized(
+                                egui::vec2(80.0, 18.0),
+                                egui::Slider::new(&mut v, 0.0..=2.0).show_value(false),
+                            );
+                            if resp.changed() {
+                                vol_changed = Some(v);
+                            }
+                        });
+                        if let Some(new_vol) = vol_changed {
+                            pending.set_volume.push((i, new_vol));
+                        }
+                        let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
                         if s.hotkey.is_some() && ui.button("✖").clicked() {
                             pending.clear_hotkey.push(i);
                         }

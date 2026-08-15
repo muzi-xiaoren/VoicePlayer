@@ -125,6 +125,8 @@ pub enum AudioCmd {
     SetEffectVolume(f32),
     SetRepeatMode(RepeatMode),
     SetLoopbackVolume(f32),
+    /// 运行时调整某个音效的单独音量（同步更新正在播放的音轨）。
+    SetSoundVolume { path: PathBuf, volume: f32 },
     /// 设备等配置变了，整个重建引擎。
     Rebuild(AppConfig),
 }
@@ -202,14 +204,19 @@ fn audio_thread(mut cfg: AppConfig, rx: Receiver<AudioCmd>, error: Arc<Mutex<Opt
                 AudioCmd::SetEffectVolume(v) => {
                     cfg.effect_volume = v;
                     if let Some(en) = &mut engine {
-                        en.set_effect_volume(v);
-                    }
-                }
+                       en.set_effect_volume(v);
+                   }
+               }
                 AudioCmd::SetRepeatMode(m) => cfg.repeat_mode = m,
                 AudioCmd::SetLoopbackVolume(v) => {
                     cfg.loopback_volume = v;
                     if let Some(en) = &engine {
                         en.set_loopback_volume(v);
+                    }
+                }
+                AudioCmd::SetSoundVolume { path, volume } => {
+                    if let Some(en) = &mut engine {
+                        en.set_sound_volume(&path, volume);
                     }
                 }
                 AudioCmd::Rebuild(c) => {
@@ -499,18 +506,31 @@ impl AudioEngine {
         self.mic_enabled.store(on, Ordering::Relaxed);
     }
 
-    /// 运行时调全局音效音量（同步作用到正在播的音轨）。
-    fn set_effect_volume(&mut self, v: f32) {
-        self.effect_volume = v;
+   /// 运行时调全局音效音量（同步作用到正在播的音轨）。
+   fn set_effect_volume(&mut self, v: f32) {
+       self.effect_volume = v;
         for vs in self.voices.values() {
             for voice in vs {
                 voice.sink.set_volume(v * voice.base);
                 if let Some(m) = &voice.mon {
-                   m.set_volume(v * voice.base);
-               }
-           }
-       }
-   }
+                    m.set_volume(v * voice.base);
+                }
+            }
+        }
+    }
+
+    /// 运行时调某个音效的单独音量（同步更新正在播放的该音效音轨）。
+    fn set_sound_volume(&mut self, path: &Path, volume: f32) {
+        if let Some(vs) = self.voices.get_mut(path) {
+            for voice in vs.iter_mut() {
+                voice.base = volume;
+                voice.sink.set_volume(self.effect_volume * volume);
+                if let Some(m) = &voice.mon {
+                    m.set_volume(self.effect_volume * volume);
+                }
+            }
+        }
+    }
 
     fn shutdown(&mut self) {
         self.loopback_stop.store(true, Ordering::Relaxed);
