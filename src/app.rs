@@ -42,14 +42,16 @@ pub struct App {
     vbcable: bool,
     capturing: Option<CaptureTarget>,
     new_profile_name: String,
-    last_scan: Instant,
-    last_signature: Vec<String>,
-    lang: i18n::Lang,
+   last_scan: Instant,
+   last_signature: Vec<String>,
+   lang: i18n::Lang,
+    last_window_save: Instant,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_cjk_fonts(&cc.egui_ctx);
-        let mut config = AppConfig::load();
+       install_cjk_fonts(&cc.egui_ctx);
+        apply_dark_theme(&cc.egui_ctx);
+       let mut config = AppConfig::load();
         let lang = i18n::resolve_lang(&config.language);
         let texts = i18n::Texts::new(lang);
         let out_devices = audio::output_devices();
@@ -96,10 +98,11 @@ impl App {
             vbcable,
             capturing: None,
             new_profile_name: String::new(),
-            last_scan: Instant::now(),
-            last_signature,
-            lang,
-        };
+           last_scan: Instant::now(),
+           last_signature,
+           lang,
+            last_window_save: Instant::now(),
+       };
         app.config.save();
         app.reregister_hotkeys();
         app
@@ -474,11 +477,39 @@ impl App {
             changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Overlap, texts.repeat_overlap).clicked();
             changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Toggle, texts.repeat_toggle).clicked();
             if changed {
-                self.audio.send(AudioCmd::SetRepeatMode(self.config.repeat_mode));
-                self.config.save();
-            }
-        });
-        if ui.checkbox(&mut self.config.autostart, texts.autostart).changed() {
+               self.audio.send(AudioCmd::SetRepeatMode(self.config.repeat_mode));
+               self.config.save();
+           }
+       });
+        ui.separator();
+        ui.label(texts.app_audio_routing);
+        ui.label(texts.app_routing_hint);
+       if ui.button(texts.open_app_volume).clicked() {
+           platform::open_app_volume_settings();
+       }
+        ui.separator();
+        ui.label(texts.loopback_title);
+        if ui.checkbox(&mut self.config.loopback_enabled, texts.loopback_enable).changed() {
+            pending.rebuild_engine = true;
+            self.config.save();
+        }
+        if self.config.loopback_enabled {
+            ui.horizontal(|ui| {
+                ui.label(texts.loopback_volume);
+                let resp = ui.add(egui::Slider::new(&mut self.config.loopback_volume, 0.0..=2.0));
+                if resp.changed() {
+                    self.audio.send(AudioCmd::SetLoopbackVolume(self.config.loopback_volume));
+                    self.config.save();
+                }
+            });
+        }
+        ui.add_space(2.0);
+        ui.label(
+            egui::Label::new(egui::RichText::new(texts.loopback_hint).small().color(egui::Color32::from_gray(140)))
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+        ui.separator();
+       if ui.checkbox(&mut self.config.autostart, texts.autostart).changed() {
             if let Err(e) = platform::set_autostart(self.config.autostart) {
                 log::error!("设置开机自启失败：{e}");
             }
@@ -621,7 +652,28 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.ui_sounds(ui, &profiles, &sounds, &mut pending);
         });
-        self.apply(pending);
+       self.apply(pending);
+        // Save window geometry every ~2 seconds so position/size persist across restarts.
+        if self.last_window_save.elapsed() >= Duration::from_secs(2) {
+            self.last_window_save = Instant::now();
+            let size = ctx.screen_rect().size();
+            let pos = ctx.input(|i| i.viewport().inner_rect.map(|r| r.min));
+            let new_w = Some(size.x);
+            let new_h = Some(size.y);
+            let (new_x, new_y) = match pos {
+                Some(p) => (Some(p.x), Some(p.y)),
+                None => (self.config.window_x, self.config.window_y),
+            };
+            if self.config.window_x != new_x || self.config.window_y != new_y
+                || self.config.window_w != new_w || self.config.window_h != new_h
+            {
+                self.config.window_x = new_x;
+                self.config.window_y = new_y;
+                self.config.window_w = new_w;
+                self.config.window_h = new_h;
+                self.config.save();
+            }
+        }
     }
 }
 /// 把 egui 的 Key 枚举映射成 Windows 虚拟键码（VK code），无法映射的返回 None。
@@ -716,5 +768,23 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             return;
         }
     }
-    log::warn!("没找到中文字体，中文可能显示为方块");
+   log::warn!("没找到中文字体，中文可能显示为方块");
+}
+
+/// Apply a professional dark theme inspired by OBS / Voicemeeter.
+fn apply_dark_theme(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = egui::Color32::from_rgb(24, 27, 38);
+    v.window_fill = egui::Color32::from_rgb(28, 32, 44);
+    v.extreme_bg_color = egui::Color32::from_rgb(14, 17, 24);
+    v.selection.bg_fill = egui::Color32::from_rgb(56, 112, 200);
+    v.widget_noninteractive.bg_fill = egui::Color32::from_rgb(24, 27, 38);
+    v.widget_noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 155, 170));
+    v.widget_inactive.bg_fill = egui::Color32::from_rgb(36, 41, 56);
+    v.widget_inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 205, 220));
+    v.widget_hovered.bg_fill = egui::Color32::from_rgb(48, 55, 72);
+    v.widget_hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 235, 245));
+    v.widget_active.bg_fill = egui::Color32::from_rgb(56, 65, 88);
+    v.widget_active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 245, 255));
+    ctx.set_visuals(v);
 }

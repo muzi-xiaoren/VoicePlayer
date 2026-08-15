@@ -97,3 +97,15 @@ pub fn open_url(url: &str) {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
 }
+
+/// Open Windows "App volume and device preferences" settings page.
+/// Users can assign per-app output devices here (e.g. route music player to CABLE Input).
+#[cfg(windows)]
+pub fn open_app_volume_settings() {
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", "ms-settings:apps-volume"])
+        .spawn();
+}
+
+#[cfg(not(windows))]
+pub fn open_app_volume_settings() {}

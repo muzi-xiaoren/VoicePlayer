@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::{AppConfig, RepeatMode};
+use crate::wasapi_loopback::{self, LoopbackBuf};
 
 /// 列出所有输出设备名。
 pub fn output_devices() -> Vec<String> {
@@ -123,6 +124,7 @@ pub enum AudioCmd {
     SetMicPassthrough(bool),
     SetEffectVolume(f32),
     SetRepeatMode(RepeatMode),
+    SetLoopbackVolume(f32),
     /// 设备等配置变了，整个重建引擎。
     Rebuild(AppConfig),
 }
@@ -204,9 +206,17 @@ fn audio_thread(mut cfg: AppConfig, rx: Receiver<AudioCmd>, error: Arc<Mutex<Opt
                     }
                 }
                 AudioCmd::SetRepeatMode(m) => cfg.repeat_mode = m,
+                AudioCmd::SetLoopbackVolume(v) => {
+                    cfg.loopback_volume = v;
+                    if let Some(en) = &engine {
+                        en.set_loopback_volume(v);
+                    }
+                }
                 AudioCmd::Rebuild(c) => {
                     cfg = c;
-                    drop(engine.take()); // 先释放旧设备，再开新的
+                    if let Some(mut en) = engine.take() {
+                        en.shutdown();
+                    }
                     engine = build_engine(&cfg, &error);
                 }
             },
@@ -250,6 +260,9 @@ struct AudioEngine {
     _mic_stream: Option<cpal::Stream>,
     mic_enabled: Arc<AtomicBool>,
     effect_volume: f32,
+    _loopback_thread: Option<std::thread::JoinHandle<()>>,
+    loopback_stop: Arc<AtomicBool>,
+    loopback_vol: Arc<std::sync::atomic::AtomicU32>,
     /// 按音频文件分组的活跃音轨（同一文件可有多条 = 叠加播放）。
     voices: HashMap<PathBuf, Vec<Voice>>,
 }
@@ -285,6 +298,22 @@ impl AudioEngine {
                 None
             }
         };
+        // --- loopback (WASAPI system audio capture) ---
+        let loopback_stop = Arc::new(AtomicBool::new(false));
+        let loopback_vol = Arc::new(std::sync::atomic::AtomicU32::new(
+            cfg.loopback_volume.to_bits(),
+        ));
+        let _loopback_thread: Option<std::thread::JoinHandle<()>> = if cfg.loopback_enabled {
+            let buf = LoopbackBuf::new();
+            let lb_vol = loopback_vol.clone();
+            let lb_src = LoopbackSource { buf: buf.clone(), vol: lb_vol };
+            if let Err(e) = out_handle.play_raw(lb_src) {
+                log::warn!("loopback play_raw: {e}");
+            }
+            Some(wasapi_loopback::start_loopback_thread(buf, loopback_stop.clone()))
+        } else {
+            None
+        };
 
         Ok(Self {
             _out_stream: out_stream,
@@ -294,6 +323,9 @@ impl AudioEngine {
             _mic_stream: mic_stream,
             mic_enabled,
             effect_volume: cfg.effect_volume,
+            _loopback_thread,
+            loopback_stop,
+            loopback_vol,
             voices: HashMap::new(),
         })
     }
@@ -474,9 +506,46 @@ impl AudioEngine {
             for voice in vs {
                 voice.sink.set_volume(v * voice.base);
                 if let Some(m) = &voice.mon {
-                    m.set_volume(v * voice.base);
-                }
-            }
+                   m.set_volume(v * voice.base);
+               }
+           }
+       }
+   }
+
+    fn shutdown(&mut self) {
+        self.loopback_stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self._loopback_thread.take() {
+            let _ = h.join();
         }
     }
+
+    fn set_loopback_volume(&self, v: f32) {
+        self.loopback_vol.store(v.to_bits(), Ordering::Relaxed);
+    }
+}
+
+struct LoopbackSource {
+    buf: Arc<LoopbackBuf>,
+    vol: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Iterator for LoopbackSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let s = self.buf.samples.lock()
+            .ok()
+            .and_then(|mut b| b.pop_front())
+            .unwrap_or(0.0);
+        let v = f32::from_bits(self.vol.load(Ordering::Relaxed));
+        Some(s * v)
+    }
+}
+
+impl Source for LoopbackSource {
+    fn current_frame_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> u16 { 2 }
+    fn sample_rate(&self) -> u32 {
+        self.buf.sample_rate.get().copied().unwrap_or(48_000)
+    }
+    fn total_duration(&self) -> Option<Duration> { None }
 }

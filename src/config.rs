@@ -69,6 +69,14 @@ pub struct AppConfig {
     pub language: Option<String>,
     /// 锁定快捷键。锁定后按快捷键不会触发任何音效。
     pub locked: bool,
+    pub loopback_pid: Option<u32>,
+    pub loopback_name: Option<String>,
+    pub loopback_enabled: bool,
+    pub loopback_volume: f32,
+    pub window_x: Option<f32>,
+    pub window_y: Option<f32>,
+    pub window_w: Option<f32>,
+    pub window_h: Option<f32>,
 }
 
 impl Default for AppConfig {
@@ -86,6 +94,14 @@ impl Default for AppConfig {
             autostart: false,
             language: None,
             locked: false,
+            loopback_pid: None,
+            loopback_name: None,
+            loopback_enabled: false,
+            loopback_volume: 1.0,
+            window_x: None,
+            window_y: None,
+            window_w: None,
+            window_h: None,
         }
     }
 }

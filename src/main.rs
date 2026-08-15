@@ -8,17 +8,28 @@ mod hotkeys;
 mod i18n;
 mod platform;
 mod profile;
+mod wasapi_loopback;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
 
     let icon = load_icon();
+    let cfg = config::AppConfig::load();
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_min_inner_size([380.0, 460.0])
+        .with_title("VoicePlayer")
+        .with_icon(std::sync::Arc::new(icon));
+    match (cfg.window_w, cfg.window_h) {
+        (Some(w), Some(h)) => viewport = viewport.with_inner_size([w, h]),
+        _ => viewport = viewport.with_inner_size([440.0, 640.0]),
+    }
+    if let (Some(x), Some(y)) = (cfg.window_x, cfg.window_y) {
+        viewport = viewport.with_position([x, y]);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([440.0, 640.0])
-            .with_min_inner_size([380.0, 460.0])
-            .with_title("VoicePlayer")
-            .with_icon(std::sync::Arc::new(icon)),
+        viewport,
         ..Default::default()
     };
 

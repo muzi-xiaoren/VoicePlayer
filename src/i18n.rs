@@ -149,6 +149,17 @@ pub struct Texts {
 
     // 默认 profile 名
     pub default_profile: &'static str,
+
+    // 应用音频路由
+    pub app_audio_routing: &'static str,
+    pub app_routing_hint: &'static str,
+    pub open_app_volume: &'static str,
+
+    // 系统音频捕获（WASAPI Loopback）
+    pub loopback_title: &'static str,
+    pub loopback_enable: &'static str,
+    pub loopback_volume: &'static str,
+    pub loopback_hint: &'static str,
 }
 
 impl Texts {
@@ -208,6 +219,13 @@ impl Texts {
             none_label: "（无）",
             select_folder_dialog_title: "选择音效文件夹",
             default_profile: "默认",
+            app_audio_routing: "应用音频路由",
+            app_routing_hint: "把特定应用（网易云、浏览器等）的音频送进虚拟麦克风：在设置页面把它的输出设备改为 CABLE Input",
+            open_app_volume: "打开应用音量设置",
+            loopback_title: "系统音频捕获",
+            loopback_enable: "捕获系统音频到麦克风",
+            loopback_volume: "捕获音量",
+            loopback_hint: "将正在播放的音频（音乐、视频等）混入虚拟麦克风（需安装 VB-CABLE）",
         })
     }
 
@@ -260,6 +278,13 @@ impl Texts {
             none_label: "(none)",
             select_folder_dialog_title: "Select sound folder",
             default_profile: "Default",
+            app_audio_routing: "App audio routing",
+            app_routing_hint: "To send a specific app's audio (browser, music player, etc.) into the virtual mic, set its output device to CABLE Input in the settings page",
+            open_app_volume: "Open app volume settings",
+            loopback_title: "System Audio Capture",
+            loopback_enable: "Capture system audio to microphone",
+            loopback_volume: "Capture Volume",
+            loopback_hint: "Mix currently playing audio (music, video, etc.) into the virtual microphone (requires VB-CABLE)",
         })
     }
 }
