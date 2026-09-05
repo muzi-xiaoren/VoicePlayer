@@ -8,6 +8,7 @@ mod hotkeys;
 mod i18n;
 mod platform;
 mod profile;
+mod theme;
 mod wasapi_loopback;
 
 fn main() -> eframe::Result<()> {

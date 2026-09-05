@@ -16,7 +16,7 @@
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -152,6 +152,8 @@ pub enum AudioCmd {
 pub struct AudioCtl {
     tx: Sender<AudioCmd>,
     error: Arc<Mutex<Option<String>>>,
+    /// 当前有音轨在播的音频文件。音频线程每轮循环刷新，界面据此高亮。
+    playing: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl AudioCtl {
@@ -163,17 +165,24 @@ impl AudioCtl {
     pub fn last_error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|e| e.clone())
     }
+
+    /// 正在播放的文件集合快照（界面每帧取一次，别在每个瓦片里各锁一遍）。
+    pub fn playing_snapshot(&self) -> HashSet<PathBuf> {
+        self.playing.lock().map(|p| p.clone()).unwrap_or_default()
+    }
 }
 
 /// 启动音频线程，返回控制柄。
 pub fn spawn(cfg: AppConfig) -> AudioCtl {
     let (tx, rx) = mpsc::channel();
     let error = Arc::new(Mutex::new(None));
+    let playing = Arc::new(Mutex::new(HashSet::new()));
     let error2 = error.clone();
+    let playing2 = playing.clone();
     let _ = std::thread::Builder::new()
         .name("audio".into())
-        .spawn(move || audio_thread(cfg, rx, error2));
-    AudioCtl { tx, error }
+        .spawn(move || audio_thread(cfg, rx, error2, playing2));
+    AudioCtl { tx, error, playing }
 }
 
 fn set_error(slot: &Arc<Mutex<Option<String>>>, e: Option<String>) {
@@ -195,7 +204,12 @@ fn build_engine(cfg: &AppConfig, error: &Arc<Mutex<Option<String>>>) -> Option<A
     }
 }
 
-fn audio_thread(mut cfg: AppConfig, rx: Receiver<AudioCmd>, error: Arc<Mutex<Option<String>>>) {
+fn audio_thread(
+    mut cfg: AppConfig,
+    rx: Receiver<AudioCmd>,
+    error: Arc<Mutex<Option<String>>>,
+    playing: Arc<Mutex<HashSet<PathBuf>>>,
+) {
     let mut engine = build_engine(&cfg, &error);
     loop {
         // 带超时的等待：空闲时也定期醒来清理已放完的 Sink。
@@ -248,6 +262,16 @@ fn audio_thread(mut cfg: AppConfig, rx: Receiver<AudioCmd>, error: Arc<Mutex<Opt
         }
         if let Some(en) = &mut engine {
             en.reap();
+        }
+        // 刷新「正在播放」快照给界面用。reap 之后 voices 里剩的就是还在响的。
+        let snapshot: HashSet<PathBuf> = engine
+            .as_ref()
+            .map(|e| e.voices.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Ok(mut p) = playing.lock() {
+            if *p != snapshot {
+                *p = snapshot;
+            }
         }
     }
 }

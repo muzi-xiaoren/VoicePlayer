@@ -88,7 +88,6 @@ pub fn resolve_lang(config_lang: &Option<String>) -> Lang {
 
 /// 集中存放界面所有可见文案。按 Lang 构造一份。
 pub struct Texts {
-    pub lang: Lang,
 
     pub title: &'static str,
 
@@ -122,17 +121,13 @@ pub struct Texts {
     pub unlock: &'static str,
     pub lock_tooltip: &'static str,
     pub unlock_tooltip: &'static str,
-    pub locked_hint: &'static str,
 
     // 音效区
     pub profile: &'static str,
     pub open_folder: &'static str,
-    pub remove: &'static str,
     pub remove_tooltip: &'static str,
-    pub new_profile: &'static str,
     pub new_profile_placeholder: &'static str,
     pub create: &'static str,
-    pub select_folder: &'static str,
     pub select_folder_tooltip: &'static str,
 
     pub stop_all: &'static str,
@@ -142,7 +137,6 @@ pub struct Texts {
 
     pub empty_hint: &'static str,
     pub set_hotkey_short: &'static str,
-    pub capturing: &'static str,
     pub capturing_cancel: &'static str,
     pub none_label: &'static str,
     pub select_folder_dialog_title: &'static str,
@@ -164,6 +158,20 @@ pub struct Texts {
 
     // 单个音效音量
     pub reset_volume_tooltip: &'static str,
+
+    // 新界面：导航 / 分组 / 状态栏
+    pub tab_sounds: &'static str,
+    pub tab_settings: &'static str,
+    pub search_placeholder: &'static str,
+    pub no_match: &'static str,
+    pub new_profile_tooltip: &'static str,
+    pub section_devices: &'static str,
+    pub section_playback: &'static str,
+    pub section_startup: &'static str,
+    pub master_volume: &'static str,
+    pub stop_all_btn: &'static str,
+    pub playing_now: &'static str,
+    pub sound_count: &'static str,
 }
 
 impl Texts {
@@ -177,7 +185,6 @@ impl Texts {
     fn zh() -> &'static Texts {
         static T: std::sync::OnceLock<Texts> = std::sync::OnceLock::new();
         T.get_or_init(|| Texts {
-            lang: Lang::Zh,
             title: "VoicePlayer",
             vbcable_detected: "✔ 已检测到 VB-CABLE",
             vbcable_not_detected: "⚠ 未检测到 VB-CABLE（游戏里听不到音效）",
@@ -202,15 +209,11 @@ impl Texts {
             unlock: "🔓 已解锁",
             lock_tooltip: "点击解锁快捷键",
             unlock_tooltip: "点击锁定快捷键",
-            locked_hint: "快捷键已锁定",
             profile: "配置",
             open_folder: "📂 打开文件夹",
-            remove: "✖ 移除",
             remove_tooltip: "从列表移除这个外部文件夹（不删除文件）",
-            new_profile: "新建配置：",
             new_profile_placeholder: "输入名字新建；也可以直接粘贴一个文件夹的完整路径",
             create: "新建",
-            select_folder: "📁 选择文件夹…",
             select_folder_tooltip: "把电脑上任意一个装音效的文件夹加成配置",
             stop_all: "停止所有音效：",
             stop_all_not_set: "未设置",
@@ -218,7 +221,6 @@ impl Texts {
             clear: "清除",
             empty_hint: "这个配置还没有音频。点「打开文件夹」把 mp3 / wav 拖进去，会自动出现在这里。",
             set_hotkey_short: "设快捷键",
-            capturing: "按下快捷键…",
             capturing_cancel: "按下快捷键…（Esc 取消）",
             none_label: "（无）",
             select_folder_dialog_title: "选择音效文件夹",
@@ -232,13 +234,24 @@ impl Texts {
             loopback_hint: "将正在播放的音频（音乐、视频等）混入虚拟麦克风（需安装 VB-CABLE）",
             loopback_monitor_conflict: "监听设备就是系统默认播放设备，系统声音你本来就直接听得到；再混一份进监听会形成回授啸叫，所以这里不重复送。想单独监听请把监听设备换成另一个设备。",
             reset_volume_tooltip: "恢复默认音量 1.00",
+            tab_sounds: "音效",
+            tab_settings: "设置",
+            search_placeholder: "搜索音效…",
+            no_match: "没有匹配的音效。",
+            new_profile_tooltip: "新建一个配置文件夹",
+            section_devices: "设备",
+            section_playback: "播放",
+            section_startup: "启动",
+            master_volume: "总音量",
+            stop_all_btn: "⏹ 停止全部",
+            playing_now: "正在播放",
+            sound_count: "个音效",
         })
     }
 
     fn en() -> &'static Texts {
         static T: std::sync::OnceLock<Texts> = std::sync::OnceLock::new();
         T.get_or_init(|| Texts {
-            lang: Lang::En,
             title: "VoicePlayer",
             vbcable_detected: "✔ VB-CABLE detected",
             vbcable_not_detected: "⚠ VB-CABLE not detected (audio won't reach the game)",
@@ -263,15 +276,11 @@ impl Texts {
             unlock: "🔓 Unlocked",
             lock_tooltip: "Click to unlock hotkeys",
             unlock_tooltip: "Click to lock hotkeys",
-            locked_hint: "Hotkeys locked",
             profile: "Profile",
             open_folder: "📂 Open folder",
-            remove: "✖ Remove",
             remove_tooltip: "Remove this external folder from the list (files are not deleted)",
-            new_profile: "New profile:",
             new_profile_placeholder: "Enter a name, or paste a full folder path",
             create: "Create",
-            select_folder: "📁 Select folder…",
             select_folder_tooltip: "Add any sound folder on your computer as a profile",
             stop_all: "Stop all sounds: ",
             stop_all_not_set: "Not set",
@@ -279,7 +288,6 @@ impl Texts {
             clear: "Clear",
             empty_hint: "No audio in this profile. Click \"Open folder\" and drop mp3 / wav files in.",
             set_hotkey_short: "Set hotkey",
-            capturing: "Press a hotkey…",
             capturing_cancel: "Press a hotkey… (Esc to cancel)",
             none_label: "(none)",
             select_folder_dialog_title: "Select sound folder",
@@ -293,6 +301,18 @@ impl Texts {
             loopback_hint: "Mix currently playing audio (music, video, etc.) into the virtual microphone (requires VB-CABLE)",
             loopback_monitor_conflict: "The monitor device is your system's default playback device, so you already hear system audio directly. Mixing it back in would cause a feedback howl, so it is skipped. Pick a different monitor device to monitor it separately.",
             reset_volume_tooltip: "Reset to default volume 1.00",
+            tab_sounds: "Sounds",
+            tab_settings: "Settings",
+            search_placeholder: "Search sounds…",
+            no_match: "No sounds match your search.",
+            new_profile_tooltip: "Create a new profile folder",
+            section_devices: "Devices",
+            section_playback: "Playback",
+            section_startup: "Startup",
+            master_volume: "Master",
+            stop_all_btn: "⏹ Stop all",
+            playing_now: "Playing",
+            sound_count: "sounds",
         })
     }
 }

@@ -5,8 +5,16 @@ use crate::hotkeys::{self, HkAction, Hotkeys};
 use crate::i18n;
 use crate::platform;
 use crate::profile::{self, Profile, Sound};
+use crate::theme;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+/// 界面分页。设置项从主界面挪走，音效列表才是主角。
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Sounds,
+    Settings,
+}
+
 /// 正在为「谁」捕获快捷键。
 #[derive(Clone, Copy, PartialEq)]
 enum CaptureTarget {
@@ -42,6 +50,11 @@ pub struct App {
     vbcable: bool,
     capturing: Option<CaptureTarget>,
     new_profile_name: String,
+    /// 「新建配置」输入框是否展开。
+    show_new_profile: bool,
+    /// 音效搜索关键字。
+    search: String,
+    page: Page,
    last_scan: Instant,
    last_signature: Vec<String>,
    lang: i18n::Lang,
@@ -50,7 +63,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
        install_cjk_fonts(&cc.egui_ctx);
-        apply_dark_theme(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx);
        let mut config = AppConfig::load();
         let lang = i18n::resolve_lang(&config.language);
         let texts = i18n::Texts::new(lang);
@@ -98,6 +111,9 @@ impl App {
             vbcable,
             capturing: None,
             new_profile_name: String::new(),
+            show_new_profile: false,
+            search: String::new(),
+            page: Page::Sounds,
            last_scan: Instant::now(),
            last_signature,
            lang,
@@ -357,11 +373,13 @@ impl App {
                     if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
                         self.add_external_folder(p, texts.select_folder_dialog_title);
                         self.new_profile_name.clear();
+                        self.show_new_profile = false;
                     }
                 } else if !input.contains('/') && !input.contains('\\') && profile::create_profile(&input).is_ok() {
                     self.profiles = Self::all_profiles(&self.config, texts.default_profile);
                     self.switch_profile(&input);
                     self.new_profile_name.clear();
+                    self.show_new_profile = false;
                 }
             }
         }
@@ -399,39 +417,50 @@ impl App {
             self.reregister_hotkeys();
         }
     }
-    fn ui_settings(
-        &mut self,
-        ui: &mut egui::Ui,
-        out_devices: &[String],
-        in_devices: &[String],
-        pending: &mut Pending,
-    ) {
+    // ─────────────────────────── 顶栏 ───────────────────────────
+    /// 应用名 + 页面切换 + 锁定 + 语言。
+    fn ui_topbar(&mut self, ui: &mut egui::Ui, pending: &mut Pending) {
         let texts = self.texts();
-        // —— 顶部行：标题 + 锁定 + 语言 ——
         ui.horizontal(|ui| {
-            ui.heading(texts.title);
+            ui.label(egui::RichText::new("🎚").size(18.0).color(theme::P.accent));
+            ui.label(egui::RichText::new(texts.title).size(16.0).strong().color(theme::P.text));
+            ui.add_space(10.0);
+
+            // 分段控件式的页面切换
+            if ui.selectable_label(self.page == Page::Sounds, texts.tab_sounds).clicked() {
+                self.page = Page::Sounds;
+            }
+            if ui.selectable_label(self.page == Page::Settings, texts.tab_settings).clicked() {
+                self.page = Page::Settings;
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 语言下拉
                 let mut lang_sel = self.lang;
-                egui::ComboBox::from_label(texts.language)
+                egui::ComboBox::from_id_salt("lang")
+                    .width(96.0)
                     .selected_text(self.lang.display())
                     .show_ui(ui, |ui| {
+                        ui.label(egui::RichText::new(texts.language).size(11.5).color(theme::P.dim));
                         for l in i18n::Lang::all() {
                             if ui.selectable_value(&mut lang_sel, l, l.display()).changed() && l != self.lang {
                                 self.lang = l;
                                 pending.lang_changed = true;
                             }
-                       }
-                   });
-                ui.separator();
-                // 锁定按钮
-                let (lock_label, lock_tooltip) = if self.config.locked {
-                    (texts.lock, texts.lock_tooltip)
+                        }
+                    });
+
+                // 锁定：锁上时用警告色，一眼能看出快捷键当前不响应
+                let (label, tip, color) = if self.config.locked {
+                    (texts.lock, texts.lock_tooltip, theme::P.warn)
                 } else {
-                    (texts.unlock, texts.unlock_tooltip)
+                    (texts.unlock, texts.unlock_tooltip, theme::P.dim)
                 };
                 let prev = self.config.locked;
-                if ui.button(lock_label).on_hover_text(lock_tooltip).clicked() {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new(label).color(color)).frame(false))
+                    .on_hover_text(tip)
+                    .clicked()
+                {
                     self.config.locked = !self.config.locked;
                 }
                 if self.config.locked != prev {
@@ -439,121 +468,88 @@ impl App {
                 }
             });
         });
-        ui.add_space(4.0);
-        // VB-CABLE 状态
-        if self.vbcable {
-            ui.colored_label(egui::Color32::from_rgb(60, 170, 90), texts.vbcable_detected);
-        } else {
-            ui.colored_label(egui::Color32::from_rgb(200, 120, 40), texts.vbcable_not_detected);
-            ui.horizontal(|ui| {
-                if ui.button(texts.open_vbcable_url).clicked() {
+    }
+
+    // ─────────────────────────── 底部状态栏 ───────────────────────────
+    /// 常驻信息：链路是否通、输出设备、总音量、停止全部。
+    fn ui_statusbar(&mut self, ui: &mut egui::Ui, pending: &mut Pending) {
+        let texts = self.texts();
+        ui.horizontal(|ui| {
+            if self.vbcable {
+                theme::status_dot(ui, theme::P.ok, texts.vbcable_detected);
+            } else {
+                theme::status_dot(ui, theme::P.warn, texts.vbcable_not_detected);
+                if ui.small_button(texts.open_vbcable_url).clicked() {
                     platform::open_url(platform::VBCABLE_URL);
                 }
-                if ui.button(texts.reinstall_detect).clicked() {
+                if ui.small_button(texts.reinstall_detect).clicked() {
                     self.refresh_devices();
                     pending.rebuild_engine = true;
                 }
-            });
-        }
-        ui.separator();
-        device_combo(ui, texts.output_device, &mut self.config.output_device, out_devices, texts.system_default, &mut pending.rebuild_engine);
-        device_combo(ui, texts.microphone, &mut self.config.input_device, in_devices, texts.system_default, &mut pending.rebuild_engine);
-        device_combo(ui, texts.monitor_device, &mut self.config.monitor_device, out_devices, texts.no_monitor, &mut pending.rebuild_engine);
-        if pending.rebuild_engine {
-            self.config.save();
-        }
-        ui.separator();
-        if ui.checkbox(&mut self.config.mic_passthrough, texts.mic_passthrough).changed() {
-            self.audio.send(AudioCmd::SetMicPassthrough(self.config.mic_passthrough));
-            self.config.save();
-        }
-        ui.horizontal(|ui| {
-            ui.label(texts.effect_volume);
-            let resp = ui.add(egui::Slider::new(&mut self.config.effect_volume, 0.0..=1.5));
-            if resp.changed() {
-                self.audio.send(AudioCmd::SetEffectVolume(self.config.effect_volume));
-                self.config.save();
             }
-        });
-        ui.horizontal(|ui| {
-            ui.label(texts.repeat_behavior);
-            let mut changed = false;
-            changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Restart, texts.repeat_restart).clicked();
-            changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Overlap, texts.repeat_overlap).clicked();
-            changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Toggle, texts.repeat_toggle).clicked();
-            if changed {
-               self.audio.send(AudioCmd::SetRepeatMode(self.config.repeat_mode));
-               self.config.save();
-           }
-       });
-        ui.separator();
-        ui.label(texts.app_audio_routing);
-        ui.label(texts.app_routing_hint);
-       if ui.button(texts.open_app_volume).clicked() {
-           platform::open_app_volume_settings();
-       }
-        ui.separator();
-        ui.label(texts.loopback_title);
-        if ui.checkbox(&mut self.config.loopback_enabled, texts.loopback_enable).changed() {
-            pending.rebuild_engine = true;
-            self.config.save();
-        }
-        if self.config.loopback_enabled {
-            ui.horizontal(|ui| {
-                ui.label(texts.loopback_volume);
-                let resp = ui.add(egui::Slider::new(&mut self.config.loopback_volume, 0.0..=2.0));
+
+            let n_playing = self.audio.playing_snapshot().len();
+            if n_playing > 0 {
+                ui.add_space(4.0);
+                theme::badge(
+                    ui,
+                    &format!("▶ {} {}", texts.playing_now, n_playing),
+                    theme::P.accent,
+                    theme::P.accent_soft,
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(texts.stop_all_btn).clicked() {
+                    self.audio.send(AudioCmd::StopAll);
+                }
+                if let Some(h) = &self.config.stop_hotkey {
+                    theme::badge(ui, &hotkeys::pretty_combo(h), theme::P.dim, theme::P.sunken);
+                }
+                ui.add_space(6.0);
+                ui.spacing_mut().slider_width = 110.0;
+                let resp = ui.add(
+                    egui::Slider::new(&mut self.config.effect_volume, 0.0..=1.5)
+                        .show_value(true)
+                        .fixed_decimals(2),
+                );
                 if resp.changed() {
-                    self.audio.send(AudioCmd::SetLoopbackVolume(self.config.loopback_volume));
+                    self.audio.send(AudioCmd::SetEffectVolume(self.config.effect_volume));
                     self.config.save();
                 }
+                ui.label(egui::RichText::new(texts.master_volume).size(12.0).color(theme::P.dim));
             });
-        }
-       ui.add_space(2.0);
-        ui.add(
-            egui::Label::new(egui::RichText::new(texts.loopback_hint).small().color(egui::Color32::from_gray(140)))
-                .wrap_mode(egui::TextWrapMode::Wrap),
-        );
-        // 捕获源就是系统默认播放设备，监听设备如果也是它就只能跳过，说明一下原因。
-        if self.config.loopback_enabled
-            && self.config.monitor_device.is_some()
-            && audio::loopback_monitor_conflicts(self.config.monitor_device.as_deref())
-        {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(texts.loopback_monitor_conflict)
-                        .small()
-                        .color(egui::Color32::from_rgb(200, 150, 60)),
-                )
-                .wrap_mode(egui::TextWrapMode::Wrap),
-            );
-        }
-       ui.separator();
-       if ui.checkbox(&mut self.config.autostart, texts.autostart).changed() {
-            if let Err(e) = platform::set_autostart(self.config.autostart) {
-                log::error!("设置开机自启失败：{e}");
-            }
-            self.config.save();
-        }
-        if let Some(err) = self.audio.last_error() {
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(210, 70, 70), format!("{}{err}", texts.audio_engine_error));
-            if ui.button(texts.retry).clicked() {
-                pending.rebuild_engine = true;
-            }
-        }
+        });
     }
+
+    // ─────────────────────────── 音效页 ───────────────────────────
     fn ui_sounds(
         &mut self,
         ui: &mut egui::Ui,
         profiles: &[String],
         sounds: &[Sound],
+        playing: &std::collections::HashSet<PathBuf>,
         pending: &mut Pending,
     ) {
         let texts = self.texts();
+
+        // ── 工具条：配置选择 + 文件夹操作 ──
         ui.horizontal(|ui| {
-            let cur = self.config.active_profile.clone().unwrap_or_else(|| texts.none_label.to_string());
-            egui::ComboBox::from_label(texts.profile)
-                .selected_text(cur)
+            let cur = self
+                .config
+                .active_profile
+                .clone()
+                .unwrap_or_else(|| texts.none_label.to_string());
+            let is_external = self
+                .config
+                .active_profile
+                .as_ref()
+                .map(|n| self.config.external_profiles.contains_key(n))
+                .unwrap_or(false);
+            let shown = if is_external { format!("📁 {cur}") } else { cur };
+            egui::ComboBox::from_id_salt("profile")
+                .width(180.0)
+                .selected_text(shown)
                 .show_ui(ui, |ui| {
                     for name in profiles {
                         let selected = self.config.active_profile.as_deref() == Some(name);
@@ -566,104 +562,338 @@ impl App {
                             pending.switch_profile = Some(name.clone());
                         }
                     }
-                });
-            if ui.button(texts.open_folder).clicked() {
+                })
+                .response
+                .on_hover_text(texts.profile);
+            if ui.button("📂").on_hover_text(texts.open_folder).clicked() {
                 pending.open_folder = true;
             }
-            let is_external = self.config.active_profile.as_ref().map(|n| self.config.external_profiles.contains_key(n)).unwrap_or(false);
-            if is_external && ui.button(texts.remove).on_hover_text(texts.remove_tooltip).clicked() {
-                pending.remove_external = self.config.active_profile.clone();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(texts.new_profile);
-            ui.text_edit_singleline(&mut self.new_profile_name).on_hover_text(texts.new_profile_placeholder);
-            if ui.button(texts.create).clicked() {
-                pending.new_profile = Some(self.new_profile_name.clone());
-            }
-            if ui.button(texts.select_folder).on_hover_text(texts.select_folder_tooltip).clicked() {
+            if ui.button("📁").on_hover_text(texts.select_folder_tooltip).clicked() {
                 pending.pick_folder = true;
             }
+            if is_external && ui.button("✖").on_hover_text(texts.remove_tooltip).clicked() {
+                pending.remove_external = self.config.active_profile.clone();
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} {}", sounds.len(), texts.sound_count))
+                        .size(12.0)
+                        .color(theme::P.dim),
+                );
+            });
         });
+
+        // ── 新建配置（默认收起，避免和常用操作抢位置）──
         ui.horizontal(|ui| {
-            let label = self.config.stop_hotkey.as_ref().map(|h| hotkeys::pretty_combo(h)).unwrap_or_else(|| texts.stop_all_not_set.to_string());
-            ui.label(format!("{}{label}", texts.stop_all));
-            if ui.button(texts.set_hotkey).clicked() {
-                pending.capture = Some(CaptureTarget::Stop);
+            if ui
+                .selectable_label(self.show_new_profile, "＋")
+                .on_hover_text(texts.new_profile_tooltip)
+                .clicked()
+            {
+                self.show_new_profile = !self.show_new_profile;
             }
-            if self.config.stop_hotkey.is_some() && ui.button(texts.clear).clicked() {
-                pending.clear_stop = true;
+            if self.show_new_profile {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.new_profile_name)
+                        .desired_width(220.0)
+                        .hint_text(texts.new_profile_placeholder),
+                );
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button(texts.create).clicked() || submit {
+                    pending.new_profile = Some(self.new_profile_name.clone());
+                }
             }
+            // 搜索框占满剩下的宽度
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .desired_width(ui.available_width())
+                    .hint_text(format!("🔍 {}", texts.search_placeholder)),
+            );
         });
-        ui.separator();
+
+        ui.add_space(4.0);
+
         if sounds.is_empty() {
-            ui.label(texts.empty_hint);
+            self.ui_empty_hint(ui, texts.empty_hint);
             return;
         }
+
+        // 搜索过滤，同时保留原始下标（pending 里用的是原始下标）
+        let needle = self.search.trim().to_lowercase();
+        let visible: Vec<(usize, &Sound)> = sounds
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| needle.is_empty() || s.name.to_lowercase().contains(&needle))
+            .collect();
+        if visible.is_empty() {
+            self.ui_empty_hint(ui, texts.no_match);
+            return;
+        }
+
+        // ── 瓦片网格：按可用宽度算列数，铺满不留空隙 ──
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (i, s) in sounds.iter().enumerate() {
-               ui.horizontal(|ui| {
-                    if ui.button("▶").clicked() {
+            let spacing = ui.spacing().item_spacing.x;
+            let avail = ui.available_width();
+            const MIN_TILE: f32 = 230.0;
+            let cols = (((avail + spacing) / (MIN_TILE + spacing)).floor()).max(1.0);
+            let tile_w = ((avail - spacing * (cols - 1.0)) / cols).floor().max(180.0);
+
+            ui.horizontal_wrapped(|ui| {
+                for (i, s) in visible {
+                    let is_playing = playing.contains(&s.path);
+                    ui.allocate_ui(egui::vec2(tile_w, 0.0), |ui| {
+                        ui.set_width(tile_w);
+                        self.ui_sound_tile(ui, i, s, is_playing, pending);
+                    });
+                }
+            });
+        });
+    }
+
+    /// 居中的空状态提示。
+    fn ui_empty_hint(&self, ui: &mut egui::Ui, text: &str) {
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).color(theme::P.dim))
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+            );
+        });
+    }
+
+    /// 单个音效瓦片：播放按钮 + 名字 + 快捷键徽章 + 音量。
+    fn ui_sound_tile(
+        &self,
+        ui: &mut egui::Ui,
+        i: usize,
+        s: &Sound,
+        is_playing: bool,
+        pending: &mut Pending,
+    ) {
+        let texts = self.texts();
+        theme::card(is_playing).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical(|ui| {
+                // 第一行：播放 + 名字（正在播时名字用强调色）
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("▶").min_size(egui::vec2(28.0, 24.0)))
+                        .clicked()
+                    {
                         pending.play.push(i);
                     }
-                    // 给右侧控件预留固定宽度，文件名用剩余空间截断显示
-                    let avail = ui.available_width();
-                    let controls_w = 360.0_f32;
-                    let label_w = (avail - controls_w).max(60.0).min(avail - 40.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(label_w, 18.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(&s.name)
-                                    .wrap_mode(egui::TextWrapMode::Truncate),
-                            );
-                        },
-                    );
-                   ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut v = s.volume;
-                        let mut vol_changed: Option<f32> = None;
-                        ui.push_id(format!("vol_slider_{i}"), |ui| {
-                            // 和上面的全局音量一样带数值框：可以拖，也可以点开直接敲具体的值。
-                            let resp = ui.add_sized(
-                                egui::vec2(130.0, 18.0),
+                    let name = egui::RichText::new(&s.name).strong().color(if is_playing {
+                        theme::P.accent
+                    } else {
+                        theme::P.text
+                    });
+                    ui.add(egui::Label::new(name).wrap_mode(egui::TextWrapMode::Truncate));
+                });
+
+                // 第二行：快捷键
+                ui.horizontal(|ui| {
+                    let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
+                    if capturing_this {
+                        let btn = egui::Button::new(
+                            egui::RichText::new(texts.capturing_cancel).size(12.0).color(theme::P.text),
+                        )
+                        .fill(theme::P.accent);
+                        ui.add(btn);
+                    } else if let Some(h) = &s.hotkey {
+                        let btn = egui::Button::new(
+                            egui::RichText::new(hotkeys::pretty_combo(h)).size(12.0).color(theme::P.text),
+                        )
+                        .fill(theme::P.accent_soft);
+                        if ui.add(btn).on_hover_text(texts.set_hotkey).clicked() {
+                            pending.capture = Some(CaptureTarget::Sound(i));
+                        }
+                        if ui.small_button("✖").on_hover_text(texts.clear).clicked() {
+                            pending.clear_hotkey.push(i);
+                        }
+                    } else {
+                        let btn = egui::Button::new(
+                            egui::RichText::new(format!("＋ {}", texts.set_hotkey_short))
+                                .size(12.0)
+                                .color(theme::P.dim),
+                        )
+                        .frame(false);
+                        if ui.add(btn).clicked() {
+                            pending.capture = Some(CaptureTarget::Sound(i));
+                        }
+                    }
+                });
+
+                // 第三行：单独音量（可拖、可直接输入数值）
+                ui.horizontal(|ui| {
+                    let mut v = s.volume;
+                    let mut changed: Option<f32> = None;
+                    let reset_w = if (v - 1.0).abs() > f32::EPSILON { 30.0 } else { 0.0 };
+                    ui.spacing_mut().slider_width = (ui.available_width() - 56.0 - reset_w).max(60.0);
+                    ui.push_id(("vol", i), |ui| {
+                        if ui
+                            .add(
                                 egui::Slider::new(&mut v, 0.0..=2.0)
                                     .show_value(true)
                                     .fixed_decimals(2),
-                            );
-                            if resp.changed() {
-                                vol_changed = Some(v);
-                            }
-                            // 不是默认值时给一个「恢复 1.00」的按钮
-                            if (v - 1.0).abs() > f32::EPSILON
-                                && ui.small_button("↺").on_hover_text(texts.reset_volume_tooltip).clicked()
-                            {
-                                vol_changed = Some(1.0);
-                            }
-                        });
-                        if let Some(new_vol) = vol_changed {
-                            pending.set_volume.push((i, new_vol));
+                            )
+                            .changed()
+                        {
+                            changed = Some(v);
                         }
-                        let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
-                        if s.hotkey.is_some() && ui.button("✖").clicked() {
-                            pending.clear_hotkey.push(i);
-                        }
-                        let btn_label = if capturing_this {
-                            texts.capturing_cancel.to_string()
-                        } else {
-                            s.hotkey.as_ref().map(|h| hotkeys::pretty_combo(h)).unwrap_or_else(|| texts.set_hotkey_short.to_string())
-                        };
-                        if ui.button(btn_label).clicked() && !capturing_this {
-                            pending.capture = Some(CaptureTarget::Sound(i));
+                        if reset_w > 0.0
+                            && ui.small_button("↺").on_hover_text(texts.reset_volume_tooltip).clicked()
+                        {
+                            changed = Some(1.0);
                         }
                     });
+                    if let Some(nv) = changed {
+                        pending.set_volume.push((i, nv));
+                    }
+                });
+            });
+        });
+    }
+
+    // ─────────────────────────── 设置页 ───────────────────────────
+    fn ui_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        out_devices: &[String],
+        in_devices: &[String],
+        pending: &mut Pending,
+    ) {
+        let texts = self.texts();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let w = ui.available_width();
+
+            // ── 设备 ──
+            theme::card(false).show(ui, |ui| {
+                ui.set_width(w - 26.0);
+                theme::section_title(ui, texts.section_devices);
+                labeled_row(ui, texts.output_device, |ui| {
+                    device_combo(ui, "out", &mut self.config.output_device, out_devices, texts.system_default, &mut pending.rebuild_engine);
+                });
+                labeled_row(ui, texts.microphone, |ui| {
+                    device_combo(ui, "in", &mut self.config.input_device, in_devices, texts.system_default, &mut pending.rebuild_engine);
+                });
+                labeled_row(ui, texts.monitor_device, |ui| {
+                    device_combo(ui, "mon", &mut self.config.monitor_device, out_devices, texts.no_monitor, &mut pending.rebuild_engine);
+                });
+                if pending.rebuild_engine {
+                    self.config.save();
+                }
+            });
+
+            // ── 播放 ──
+            theme::card(false).show(ui, |ui| {
+                ui.set_width(w - 26.0);
+                theme::section_title(ui, texts.section_playback);
+                if ui.checkbox(&mut self.config.mic_passthrough, texts.mic_passthrough).changed() {
+                    self.audio.send(AudioCmd::SetMicPassthrough(self.config.mic_passthrough));
+                    self.config.save();
+                }
+                labeled_row(ui, texts.effect_volume, |ui| {
+                    if ui
+                        .add(egui::Slider::new(&mut self.config.effect_volume, 0.0..=1.5).fixed_decimals(2))
+                        .changed()
+                    {
+                        self.audio.send(AudioCmd::SetEffectVolume(self.config.effect_volume));
+                        self.config.save();
+                    }
+                });
+                labeled_row(ui, texts.repeat_behavior, |ui| {
+                    let mut changed = false;
+                    changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Restart, texts.repeat_restart).clicked();
+                    changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Overlap, texts.repeat_overlap).clicked();
+                    changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Toggle, texts.repeat_toggle).clicked();
+                    if changed {
+                        self.audio.send(AudioCmd::SetRepeatMode(self.config.repeat_mode));
+                        self.config.save();
+                    }
+                });
+                labeled_row(ui, texts.stop_all, |ui| {
+                    let capturing = self.capturing == Some(CaptureTarget::Stop);
+                    let label = if capturing {
+                        texts.capturing_cancel.to_string()
+                    } else {
+                        self.config
+                            .stop_hotkey
+                            .as_ref()
+                            .map(|h| hotkeys::pretty_combo(h))
+                            .unwrap_or_else(|| texts.stop_all_not_set.to_string())
+                    };
+                    if ui.button(label).clicked() && !capturing {
+                        pending.capture = Some(CaptureTarget::Stop);
+                    }
+                    if self.config.stop_hotkey.is_some() && ui.small_button("✖").clicked() {
+                        pending.clear_stop = true;
+                    }
+                });
+            });
+
+            // ── 系统音频 ──
+            theme::card(false).show(ui, |ui| {
+                ui.set_width(w - 26.0);
+                theme::section_title(ui, texts.loopback_title);
+                if ui.checkbox(&mut self.config.loopback_enabled, texts.loopback_enable).changed() {
+                    pending.rebuild_engine = true;
+                    self.config.save();
+                }
+                if self.config.loopback_enabled {
+                    labeled_row(ui, texts.loopback_volume, |ui| {
+                        if ui
+                            .add(egui::Slider::new(&mut self.config.loopback_volume, 0.0..=2.0).fixed_decimals(2))
+                            .changed()
+                        {
+                            self.audio.send(AudioCmd::SetLoopbackVolume(self.config.loopback_volume));
+                            self.config.save();
+                        }
+                    });
+                }
+                hint(ui, texts.loopback_hint, theme::P.dim);
+                if self.config.loopback_enabled
+                    && self.config.monitor_device.is_some()
+                    && audio::loopback_monitor_conflicts(self.config.monitor_device.as_deref())
+                {
+                    hint(ui, texts.loopback_monitor_conflict, theme::P.warn);
+                }
+                ui.add_space(8.0);
+                theme::section_title(ui, texts.app_audio_routing);
+                hint(ui, texts.app_routing_hint, theme::P.dim);
+                if ui.button(texts.open_app_volume).clicked() {
+                    platform::open_app_volume_settings();
+                }
+            });
+
+            // ── 启动 ──
+            theme::card(false).show(ui, |ui| {
+                ui.set_width(w - 26.0);
+                theme::section_title(ui, texts.section_startup);
+                if ui.checkbox(&mut self.config.autostart, texts.autostart).changed() {
+                    if let Err(e) = platform::set_autostart(self.config.autostart) {
+                        log::error!("设置开机自启失败：{e}");
+                    }
+                    self.config.save();
+                }
+            });
+
+            // ── 出错时才出现的一张卡 ──
+            if let Some(err) = self.audio.last_error() {
+                theme::card(false).show(ui, |ui| {
+                    ui.set_width(w - 26.0);
+                    ui.colored_label(theme::P.danger, format!("{}{err}", texts.audio_engine_error));
+                    if ui.button(texts.retry).clicked() {
+                        pending.rebuild_engine = true;
+                    }
                 });
             }
         });
     }
 }
+
 impl eframe::App for App {
-   fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 始终以 ~50ms 刷帧：保证快捷键触发响应及时（egui 后备触发依赖刷帧）。
         ctx.request_repaint_after(Duration::from_millis(50));
         self.maybe_rescan();
@@ -673,23 +903,48 @@ impl eframe::App for App {
         if !was_capturing {
             self.poll_egui_trigger(ctx);
         }
+
         let out_devices = self.out_devices.clone();
         let in_devices = self.in_devices.clone();
         let profiles = self.profiles.clone();
         let sounds = self.profile.as_ref().map(|p| p.sounds.clone()).unwrap_or_default();
+        let playing = self.audio.playing_snapshot();
         let mut pending = Pending::default();
-        egui::TopBottomPanel::top("settings").resizable(false).show(ctx, |ui| {
-            self.ui_settings(ui, &out_devices, &in_devices, &mut pending);
-        });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.ui_sounds(ui, &profiles, &sounds, &mut pending);
-        });
-       self.apply(pending);
+
+        egui::TopBottomPanel::top("topbar")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::P.surface)
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+            )
+            .show(ctx, |ui| self.ui_topbar(ui, &mut pending));
+
+        egui::TopBottomPanel::bottom("statusbar")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::P.surface)
+                    .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
+            )
+            .show(ctx, |ui| self.ui_statusbar(ui, &mut pending));
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::P.bg)
+                    .inner_margin(egui::Margin::same(12.0)),
+            )
+            .show(ctx, |ui| match self.page {
+                Page::Sounds => self.ui_sounds(ui, &profiles, &sounds, &playing, &mut pending),
+                Page::Settings => self.ui_settings(ui, &out_devices, &in_devices, &mut pending),
+            });
+
+        self.apply(pending);
+
         // 每 ~2 秒记一次窗口几何，下次启动恢复。
         // 注意：ctx.screen_rect() 的原点恒为 (0,0)，拿不到窗口在屏幕上的位置，
         // 位置必须从 viewport 信息里的 outer_rect 取（和启动时 with_position 对应的就是外框）。
-       if self.last_window_save.elapsed() >= Duration::from_secs(2) {
-           self.last_window_save = Instant::now();
+        if self.last_window_save.elapsed() >= Duration::from_secs(2) {
+            self.last_window_save = Instant::now();
             let (outer, inner, minimized) = ctx.input(|i| {
                 let vp = i.viewport();
                 (vp.outer_rect, vp.inner_rect, vp.minimized.unwrap_or(false))
@@ -714,6 +969,27 @@ impl eframe::App for App {
         }
     }
 }
+
+/// 设置页里的一行：左侧固定宽度的标签 + 右侧控件，多行之间左边缘对齐。
+fn labeled_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(132.0, 20.0),
+            egui::Label::new(egui::RichText::new(label).color(theme::P.dim))
+                .wrap_mode(egui::TextWrapMode::Truncate),
+        );
+        add(ui);
+    });
+}
+
+/// 一段会自动换行的小字说明。
+fn hint(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.add(
+        egui::Label::new(egui::RichText::new(text).size(11.5).color(color))
+            .wrap_mode(egui::TextWrapMode::Wrap),
+    );
+}
+
 /// 把 egui 的 Key 枚举映射成 Windows 虚拟键码（VK code），无法映射的返回 None。
 fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
     use egui::Key;
@@ -767,13 +1043,14 @@ fn disambiguate_numpad(vk: u32) -> u32 {
 }
 fn device_combo(
     ui: &mut egui::Ui,
-    label: &str,
+    id: &str,
     selected: &mut Option<String>,
     devices: &[String],
     none_text: &str,
     changed: &mut bool,
 ) {
-    egui::ComboBox::from_label(label)
+    egui::ComboBox::from_id_salt(id)
+        .width(ui.available_width().min(300.0))
         .selected_text(selected.clone().unwrap_or_else(|| none_text.to_string()))
         .show_ui(ui, |ui| {
             if ui.selectable_label(selected.is_none(), none_text).clicked() && selected.is_some() {
@@ -789,6 +1066,7 @@ fn device_combo(
             }
         });
 }
+
 fn install_cjk_fonts(ctx: &egui::Context) {
     let candidates = [
         "C:/Windows/Fonts/msyh.ttc",
@@ -807,22 +1085,4 @@ fn install_cjk_fonts(ctx: &egui::Context) {
         }
     }
    log::warn!("没找到中文字体，中文可能显示为方块");
-}
-
-/// Apply a professional dark theme inspired by OBS / Voicemeeter.
-fn apply_dark_theme(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = egui::Color32::from_rgb(24, 27, 38);
-    v.window_fill = egui::Color32::from_rgb(28, 32, 44);
-    v.extreme_bg_color = egui::Color32::from_rgb(14, 17, 24);
-    v.selection.bg_fill = egui::Color32::from_rgb(56, 112, 200);
-    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 27, 38);
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 155, 170));
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(36, 41, 56);
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 205, 220));
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(48, 55, 72);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 235, 245));
-    v.widgets.active.bg_fill = egui::Color32::from_rgb(56, 65, 88);
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 245, 255));
-    ctx.set_visuals(v);
 }
