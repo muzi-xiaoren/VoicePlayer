@@ -49,6 +49,22 @@ pub fn vbcable_installed() -> bool {
     output_devices().iter().any(|n| n.contains("CABLE Input"))
 }
 
+/// 系统默认播放设备名。WASAPI 环回捕获抓的就是这个设备，
+/// 所以监听设备一旦和它相同就会形成「播出去→又被抓回来」的回授。
+pub fn default_output_name() -> Option<String> {
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|d| d.name().ok())
+}
+
+/// 监听设备是否就是环回捕获源（此时不能把捕获到的系统声音再送进监听，否则啸叫）。
+pub fn loopback_monitor_conflicts(monitor_device: Option<&str>) -> bool {
+    match (monitor_device, default_output_name()) {
+        (Some(m), Some(d)) => m == d,
+        _ => false,
+    }
+}
+
 /// 猜一个默认应该选的输出设备名：优先 VB-CABLE 的 CABLE Input。
 pub fn guess_cable_output() -> Option<String> {
     output_devices().into_iter().find(|n| n.contains("CABLE Input"))
@@ -312,10 +328,34 @@ impl AudioEngine {
         ));
         let _loopback_thread: Option<std::thread::JoinHandle<()>> = if cfg.loopback_enabled {
             let buf = LoopbackBuf::new();
-            let lb_vol = loopback_vol.clone();
-            let lb_src = LoopbackSource { buf: buf.clone(), vol: lb_vol };
+            // 主输出（虚拟麦克风）
+            let lb_src = LoopbackSource {
+                buf: buf.clone(),
+                vol: loopback_vol.clone(),
+                monitor: false,
+            };
             if let Err(e) = out_handle.play_raw(lb_src) {
                 log::warn!("loopback play_raw: {e}");
+            }
+            // 监听（耳机）：只有监听设备和环回捕获源不是同一个设备时才送，
+            // 否则「放出去的声音又被抓回来」会滚成啸叫。
+            match (&mon_handle, loopback_monitor_conflicts(cfg.monitor_device.as_deref())) {
+                (Some(h), false) => {
+                    buf.mon_enabled.store(true, Ordering::Relaxed);
+                    let lb_mon = LoopbackSource {
+                        buf: buf.clone(),
+                        vol: loopback_vol.clone(),
+                        monitor: true,
+                    };
+                    if let Err(e) = h.play_raw(lb_mon) {
+                        log::warn!("loopback monitor play_raw: {e}");
+                        buf.mon_enabled.store(false, Ordering::Relaxed);
+                    }
+                }
+                (Some(_), true) => log::info!(
+                    "监听设备就是系统默认播放设备，跳过环回监听（避免回授啸叫）"
+                ),
+                (None, _) => {}
             }
             Some(wasapi_loopback::start_loopback_thread(buf, loopback_stop.clone()))
         } else {
@@ -547,12 +587,15 @@ impl AudioEngine {
 struct LoopbackSource {
     buf: Arc<LoopbackBuf>,
     vol: Arc<std::sync::atomic::AtomicU32>,
+    /// true = 读监听队列（耳机），false = 读主输出队列（虚拟麦克风）。
+    monitor: bool,
 }
 
 impl Iterator for LoopbackSource {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        let s = self.buf.samples.lock()
+        let q = if self.monitor { &self.buf.mon } else { &self.buf.samples };
+        let s = q.lock()
             .ok()
             .and_then(|mut b| b.pop_front())
             .unwrap_or(0.0);

@@ -8,9 +8,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// 环形缓冲区 + 采样率信息。
+///
+/// 捕获到的样本要送给两路消费者（虚拟麦克风 + 耳机监听），而 `next()` 是「弹出」
+/// 语义，两路共用一个队列会互相抢样本，所以各自一条队列，捕获线程同时写两份。
 pub struct LoopbackBuf {
-    /// 交错 f32 样本（始终 stereo）。
+    /// 交错 f32 样本（始终 stereo），送往主输出（CABLE Input）。
     pub samples: Mutex<VecDeque<f32>>,
+    /// 同样的样本，送往监听设备（耳机）。只在 `mon_enabled` 为真时写入。
+    pub mon: Mutex<VecDeque<f32>>,
+    /// 是否有监听消费者。没有时不写 `mon`，省一次拷贝。
+    pub mon_enabled: AtomicBool,
     /// 捕获线程确定采样率后写入。
     pub sample_rate: OnceLock<u32>,
 }
@@ -19,6 +26,8 @@ impl LoopbackBuf {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             samples: Mutex::new(VecDeque::with_capacity(Self::CAP)),
+            mon: Mutex::new(VecDeque::new()),
+            mon_enabled: AtomicBool::new(false),
             sample_rate: OnceLock::new(),
         })
     }
@@ -197,11 +206,12 @@ mod ffi {
 
     unsafe fn release(obj: *mut c_void) {
         if obj.is_null() { return; }
-        let vptr = *(obj as *const *const u8);
+        // obj -> vtable -> 第 3 个槽位（QueryInterface / AddRef / Release）里存的函数指针。
+        // 注意要把槽位里的值读出来，而不是拿槽位自己的地址。
+        let vptr = *(obj as *const *const usize);
+        let slot = *vptr.add(2);
         let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 =
-            std::mem::transmute(
-                (vptr as *const u8).add(2 * std::mem::size_of::<usize>()),
-            );
+            std::mem::transmute(slot);
         release_fn(obj);
     }
 
@@ -242,6 +252,25 @@ mod ffi {
             b.push_back(r);
         }
         while b.len() > LoopbackBuf::CAP { b.pop_front(); }
+        drop(b);
+        if buf.mon_enabled.load(Ordering::Relaxed) {
+            if let Ok(mut m) = buf.mon.lock() {
+                for frame in 0..num_frames {
+                    let off = frame * fb;
+                    if off + fb > data.len() { break; }
+                    let (l, r) = if ch >= 2 {
+                        (read_sample(&data[off..], bps, is_float),
+                         read_sample(&data[off + bps..], bps, is_float))
+                    } else {
+                        let s = read_sample(&data[off..], bps, is_float);
+                        (s, s)
+                    };
+                    m.push_back(l);
+                    m.push_back(r);
+                }
+                while m.len() > LoopbackBuf::CAP { m.pop_front(); }
+            }
+        }
     }
 
     pub(super) unsafe fn run_loopback(
@@ -285,9 +314,10 @@ mod ffi {
 
         let _ = buf.sample_rate.set(sample_rate);
 
+        // 共享模式下 pFormat 不能为 NULL（否则 E_POINTER）；环回捕获必须用设备的混音格式。
         let hr = (vtbl::<ClientVtbl>(client).initialize)(
             client, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-            0, 0, std::ptr::null(), std::ptr::null(),
+            0, 0, mix, std::ptr::null(),
         );
         if hr < 0 {
             CoTaskMemFree(mix as *const c_void);

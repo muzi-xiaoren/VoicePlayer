@@ -160,6 +160,10 @@ pub struct Texts {
     pub loopback_enable: &'static str,
     pub loopback_volume: &'static str,
     pub loopback_hint: &'static str,
+    pub loopback_monitor_conflict: &'static str,
+
+    // 单个音效音量
+    pub reset_volume_tooltip: &'static str,
 }
 
 impl Texts {
@@ -226,6 +230,8 @@ impl Texts {
             loopback_enable: "捕获系统音频到麦克风",
             loopback_volume: "捕获音量",
             loopback_hint: "将正在播放的音频（音乐、视频等）混入虚拟麦克风（需安装 VB-CABLE）",
+            loopback_monitor_conflict: "监听设备就是系统默认播放设备，系统声音你本来就直接听得到；再混一份进监听会形成回授啸叫，所以这里不重复送。想单独监听请把监听设备换成另一个设备。",
+            reset_volume_tooltip: "恢复默认音量 1.00",
         })
     }
 
@@ -285,6 +291,8 @@ impl Texts {
             loopback_enable: "Capture system audio to microphone",
             loopback_volume: "Capture Volume",
             loopback_hint: "Mix currently playing audio (music, video, etc.) into the virtual microphone (requires VB-CABLE)",
+            loopback_monitor_conflict: "The monitor device is your system's default playback device, so you already hear system audio directly. Mixing it back in would cause a feedback howl, so it is skipped. Pick a different monitor device to monitor it separately.",
+            reset_volume_tooltip: "Reset to default volume 1.00",
         })
     }
 }

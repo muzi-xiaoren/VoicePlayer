@@ -1,6 +1,6 @@
 [package]
 name = "voiceplayer"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 description = "轻量级 Windows 声卡音效热键工具（类 Soundpad）"
 license = "MIT"

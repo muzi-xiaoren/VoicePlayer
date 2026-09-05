@@ -513,6 +513,20 @@ impl App {
             egui::Label::new(egui::RichText::new(texts.loopback_hint).small().color(egui::Color32::from_gray(140)))
                 .wrap_mode(egui::TextWrapMode::Wrap),
         );
+        // 捕获源就是系统默认播放设备，监听设备如果也是它就只能跳过，说明一下原因。
+        if self.config.loopback_enabled
+            && self.config.monitor_device.is_some()
+            && audio::loopback_monitor_conflicts(self.config.monitor_device.as_deref())
+        {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(texts.loopback_monitor_conflict)
+                        .small()
+                        .color(egui::Color32::from_rgb(200, 150, 60)),
+                )
+                .wrap_mode(egui::TextWrapMode::Wrap),
+            );
+        }
        ui.separator();
        if ui.checkbox(&mut self.config.autostart, texts.autostart).changed() {
             if let Err(e) = platform::set_autostart(self.config.autostart) {
@@ -594,7 +608,7 @@ impl App {
                     }
                     // 给右侧控件预留固定宽度，文件名用剩余空间截断显示
                     let avail = ui.available_width();
-                    let controls_w = 290.0_f32;
+                    let controls_w = 360.0_f32;
                     let label_w = (avail - controls_w).max(60.0).min(avail - 40.0);
                     ui.allocate_ui_with_layout(
                         egui::vec2(label_w, 18.0),
@@ -610,12 +624,21 @@ impl App {
                         let mut v = s.volume;
                         let mut vol_changed: Option<f32> = None;
                         ui.push_id(format!("vol_slider_{i}"), |ui| {
+                            // 和上面的全局音量一样带数值框：可以拖，也可以点开直接敲具体的值。
                             let resp = ui.add_sized(
-                                egui::vec2(80.0, 18.0),
-                                egui::Slider::new(&mut v, 0.0..=2.0).show_value(false),
+                                egui::vec2(130.0, 18.0),
+                                egui::Slider::new(&mut v, 0.0..=2.0)
+                                    .show_value(true)
+                                    .fixed_decimals(2),
                             );
                             if resp.changed() {
                                 vol_changed = Some(v);
+                            }
+                            // 不是默认值时给一个「恢复 1.00」的按钮
+                            if (v - 1.0).abs() > f32::EPSILON
+                                && ui.small_button("↺").on_hover_text(texts.reset_volume_tooltip).clicked()
+                            {
+                                vol_changed = Some(1.0);
                             }
                         });
                         if let Some(new_vol) = vol_changed {
@@ -662,22 +685,31 @@ impl eframe::App for App {
             self.ui_sounds(ui, &profiles, &sounds, &mut pending);
         });
        self.apply(pending);
-        // Save window geometry every ~2 seconds so position/size persist across restarts.
+        // 每 ~2 秒记一次窗口几何，下次启动恢复。
+        // 注意：ctx.screen_rect() 的原点恒为 (0,0)，拿不到窗口在屏幕上的位置，
+        // 位置必须从 viewport 信息里的 outer_rect 取（和启动时 with_position 对应的就是外框）。
        if self.last_window_save.elapsed() >= Duration::from_secs(2) {
            self.last_window_save = Instant::now();
-           let size = ctx.screen_rect().size();
-           let new_w = Some(size.x);
-           let new_h = Some(size.y);
-            let new_x = Some(ctx.screen_rect().min.x);
-            let new_y = Some(ctx.screen_rect().min.y);
-           if self.config.window_x != new_x || self.config.window_y != new_y
-                || self.config.window_w != new_w || self.config.window_h != new_h
-            {
-                self.config.window_x = new_x;
-                self.config.window_y = new_y;
-                self.config.window_w = new_w;
-                self.config.window_h = new_h;
-                self.config.save();
+            let (outer, inner, minimized) = ctx.input(|i| {
+                let vp = i.viewport();
+                (vp.outer_rect, vp.inner_rect, vp.minimized.unwrap_or(false))
+            });
+            // 最小化时窗口坐标没有意义，别把它存下来。
+            if !minimized {
+                let new_x = outer.map(|r| r.min.x).or(self.config.window_x);
+                let new_y = outer.map(|r| r.min.y).or(self.config.window_y);
+                let size = inner.map(|r| r.size()).unwrap_or_else(|| ctx.screen_rect().size());
+                let new_w = Some(size.x);
+                let new_h = Some(size.y);
+                if self.config.window_x != new_x || self.config.window_y != new_y
+                    || self.config.window_w != new_w || self.config.window_h != new_h
+                {
+                    self.config.window_x = new_x;
+                    self.config.window_y = new_y;
+                    self.config.window_w = new_w;
+                    self.config.window_h = new_h;
+                    self.config.save();
+                }
             }
         }
     }
