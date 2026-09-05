@@ -6,7 +6,7 @@
 //! - 用原始虚拟键码（VK code），精确区分主键盘数字键和小键盘数字键。
 //!
 //! 钩子回调运行在独立的 Windows 消息循环线程里，不依赖 egui 刷帧。
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -146,13 +146,15 @@ struct HookShared {
     capture_tx: Mutex<Option<Sender<Option<(u8, u32)>>>>,
     on_action: Arc<dyn Fn(HkAction) + Send + Sync>,
     hook_installed: AtomicBool,
+    /// Hotkeys 句柄还活着。回调只读这个原子量，不需要锁。
+    active: AtomicBool,
     dedup_key: AtomicU32,
     dedup_time: AtomicU64,
 }
-static SHARED: OnceLock<Mutex<Option<Arc<HookShared>>>> = OnceLock::new();
-fn shared_mutex() -> &'static Mutex<Option<Arc<HookShared>>> {
-    SHARED.get_or_init(|| Mutex::new(None))
-}
+/// 钩子回调要用到的共享状态。回调是**系统级热路径**（每一次按键都会走），
+/// 所以这里用 OnceLock 而不是 Mutex：回调里不加锁，避免被 UI 线程卡住 ——
+/// 低级钩子回调超时（默认 300ms）会被 Windows 直接摘掉，且不会有任何通知。
+static SHARED: OnceLock<Arc<HookShared>> = OnceLock::new();
 /// UI 端的热键管理句柄。
 pub struct Hotkeys {
     shared: Arc<HookShared>,
@@ -170,6 +172,7 @@ impl Hotkeys {
             capture_tx: Mutex::new(None),
             on_action: Arc::new(on_action),
             hook_installed: AtomicBool::new(false),
+            active: AtomicBool::new(true),
             dedup_key: AtomicU32::new(0),
             dedup_time: AtomicU64::new(0),
         });
@@ -256,8 +259,11 @@ impl HookShared {
         let now = now_ms();
         let prev_key = self.dedup_key.load(Ordering::Relaxed);
         let prev_time = self.dedup_time.load(Ordering::Relaxed);
-        if prev_key == key && now.saturating_sub(prev_time) < 300 {
-            return; // 300ms 内已触发过同一个组合键，跳过
+        // 只用来挡「钩子和 egui 后备路径撞同一次按键」，不是用来限制连按频率的。
+        // 原来是 300ms，会把 300ms 内的连按整个吃掉，
+        // 「叠加再播」那种模式下手速快一点就丢音。
+        if prev_key == key && now.saturating_sub(prev_time) < 40 {
+            return;
         }
         self.dedup_key.store(key, Ordering::Relaxed);
         self.dedup_time.store(now, Ordering::Relaxed);
@@ -268,14 +274,7 @@ impl HookShared {
 }
 impl Drop for Hotkeys {
     fn drop(&mut self) {
-        #[cfg(windows)]
-        {
-            if let Some(m) = SHARED.get() {
-                if let Ok(mut g) = m.lock() {
-                    *g = None;
-                }
-            }
-        }
+        self.shared.active.store(false, Ordering::Relaxed);
     }
 }
 fn is_modifier_key(vk: u32) -> bool {
@@ -363,7 +362,7 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
         let is_down = wparam == win::WM_KEYDOWN || wparam == win::WM_SYSKEYDOWN;
         let is_up = wparam == win::WM_KEYUP || wparam == win::WM_SYSKEYUP;
         if is_down || is_up {
-            if let Some(shared) = shared_mutex().lock().ok().and_then(|g| g.clone()) {
+            if let Some(shared) = SHARED.get().filter(|s| s.active.load(Ordering::Relaxed)) {
                 if shared.capturing.load(Ordering::Relaxed) {
                     if is_down && !is_modifier_key(vk) {
                         let result = if vk == VK_ESCAPE { None } else { Some((win::get_modifiers(), vk)) };
@@ -374,19 +373,27 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
                     }
                 } else {
                     let mods = win::get_modifiers();
-                    let key = combo_key(mods, vk);
+                    // 「这个键是不是已经按着」必须只按 vk 记，**不能带修饰键**：
+                    // 按下时 mods 和松开时 mods 可能不一样（游戏里 Shift/Ctrl 常年按着，
+                    // 中途按一下或松一下就变了），键不同就配不上对，
+                    // 松开的记录删不掉，这个键从此被当成「一直按着」，再也不会触发。
+                    // 这就是「后台按键突然不响，重启才好」的根因。
                     if is_down {
+                        let now = now_ms();
                         let already_down = DOWN_KEYS.with(|dk| {
                             let mut dk = dk.borrow_mut();
-                            let was = dk.contains(&key);
-                            dk.insert(key);
-                            was
+                            // 兜底：万一漏收了 key-up（切到安全桌面、钩子被临时摘掉等），
+                            // 超过 STALE_MS 没再收到该键任何事件就视为已松开。
+                            dk.retain(|_, t| now.saturating_sub(*t) < STALE_MS);
+                            // insert 返回旧值：有旧值 = 之前就按着（自动重复），
+                            // 同时刷新时间戳，所以一直按着的键不会被上面的清理误伤。
+                            dk.insert(vk, now).is_some()
                         });
                         if !already_down {
                             shared.fire_if_bound(mods, vk);
                         }
                     } else if is_up {
-                        DOWN_KEYS.with(|dk| { dk.borrow_mut().remove(&key); });
+                        DOWN_KEYS.with(|dk| { dk.borrow_mut().remove(&vk); });
                     }
                 }
             }
@@ -394,22 +401,24 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
     }
     unsafe { win::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
+/// 多久没再收到某个键的事件就认为它已经松开（漏收 key-up 时的兜底）。
+#[cfg(windows)]
+const STALE_MS: u64 = 5_000;
+
+// 当前物理按下的键：vk -> 最近一次 key-down 的时刻。只在钩子线程里访问。
 #[cfg(windows)]
 thread_local! {
-    static DOWN_KEYS: std::cell::RefCell<HashSet<u32>> = std::cell::RefCell::new(HashSet::new());
+    static DOWN_KEYS: std::cell::RefCell<HashMap<u32, u64>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 #[cfg(windows)]
 fn hook_thread(shared: Arc<HookShared>) {
-    {
-        let mut g = shared_mutex().lock().unwrap();
-        *g = Some(shared.clone());
-    }
+    let _ = SHARED.set(shared.clone());
     unsafe {
         let hook = match win::install_hook() {
             Some(h) => h,
             None => {
-                let mut g = shared_mutex().lock().unwrap();
-                *g = None;
+                shared.active.store(false, Ordering::Relaxed);
                 return;
             }
         };
@@ -419,8 +428,7 @@ fn hook_thread(shared: Arc<HookShared>) {
         win::remove_hook(hook);
         log::info!("低级键盘钩子已卸载");
     }
-    let mut g = shared_mutex().lock().unwrap();
-    *g = None;
+    shared.active.store(false, Ordering::Relaxed);
 }
 #[cfg(not(windows))]
 fn hook_thread(_shared: Arc<HookShared>) {}

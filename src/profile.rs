@@ -30,6 +30,9 @@ struct Binding {
     hotkey: Option<String>,
     #[serde(default = "default_volume")]
     volume: f32,
+    /// 手动排序位置。None = 还没排过（新拖进来的文件），按名字排在最后。
+    #[serde(default)]
+    order: Option<u32>,
 }
 
 fn default_volume() -> f32 {
@@ -94,7 +97,7 @@ impl Profile {
             .unwrap_or_default();
 
         // 扫描音频文件
-        let mut sounds: Vec<Sound> = std::fs::read_dir(&dir)
+        let mut ordered: Vec<(Option<u32>, Sound)> = std::fs::read_dir(&dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.path())
@@ -111,17 +114,26 @@ impl Profile {
                             .unwrap_or(&file_name)
                             .to_string();
                         let b = bindings.get(&file_name);
-                        Sound {
-                            name,
-                            path: p,
-                            hotkey: b.and_then(|b| b.hotkey.clone()),
-                            volume: b.map(|b| b.volume).unwrap_or(1.0),
-                        }
+                        (
+                            b.and_then(|b| b.order),
+                            Sound {
+                                name,
+                                path: p,
+                                hotkey: b.and_then(|b| b.hotkey.clone()),
+                                volume: b.map(|b| b.volume).unwrap_or(1.0),
+                            },
+                        )
                     })
                     .collect()
             })
             .unwrap_or_default();
-        sounds.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        // 先按手动顺序，没排过的（新拖进来的）按名字接在最后。
+        ordered.sort_by(|(oa, a), (ob, b)| {
+            oa.unwrap_or(u32::MAX)
+                .cmp(&ob.unwrap_or(u32::MAX))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        let sounds: Vec<Sound> = ordered.into_iter().map(|(_, s)| s).collect();
 
         Profile {
             name: name.to_string(),
@@ -130,16 +142,18 @@ impl Profile {
         }
     }
 
-    /// 把当前绑定写回 `_bindings.json`。
+    /// 把当前绑定写回 `_bindings.json`。列表当前的先后顺序会作为 `order` 存下来，
+    /// 所以手动拖动排序是持久的。
     pub fn save_bindings(&self) {
         let mut map: BTreeMap<String, Binding> = BTreeMap::new();
-        for s in &self.sounds {
+        for (i, s) in self.sounds.iter().enumerate() {
             if let Some(fname) = s.path.file_name().and_then(|n| n.to_str()) {
                 map.insert(
                     fname.to_string(),
                     Binding {
                         hotkey: s.hotkey.clone(),
                         volume: s.volume,
+                        order: Some(i as u32),
                     },
                 );
             }
@@ -147,6 +161,21 @@ impl Profile {
         if let Ok(json) = serde_json::to_string_pretty(&map) {
             let _ = std::fs::write(Self::bindings_file(&self.dir), json);
         }
+    }
+
+    /// 把第 `from` 项移动到第 `to` 项的位置（拖动排序用）。
+    pub fn move_sound(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.sounds.len() || to >= self.sounds.len() {
+            return;
+        }
+        let s = self.sounds.remove(from);
+        self.sounds.insert(to, s);
+    }
+
+    /// 按名字重排（放弃手动顺序）。
+    pub fn sort_by_name(&mut self) {
+        self.sounds
+            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     }
 
     /// 当前文件夹里的音频文件名集合（用于「有没有新文件」的轻量比对）。

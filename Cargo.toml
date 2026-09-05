@@ -1,6 +1,6 @@
 [package]
 name = "voiceplayer"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
 description = "轻量级 Windows 声卡音效热键工具（类 Soundpad）"
 license = "MIT"
@@ -27,6 +27,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",

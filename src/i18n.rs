@@ -44,24 +44,24 @@ impl Lang {
 }
 
 /// 检测系统当前语言，返回匹配的 Lang。检测失败时默认中文。
+///
+/// 注意：这里**不能**用 `Command::new("reg")` 去查注册表 —— 每 spawn 一个控制台子进程，
+/// Windows 就会闪一个 cmd 黑窗（即使主程序编译成了 windows_subsystem = "windows"）。
+/// 直接调 kernel32 的 GetUserDefaultLocaleName，无进程、无窗口，还更快。
 #[cfg(windows)]
 pub fn detect_system_lang() -> Lang {
-    use std::process::Command;
-    // 通过注册表读取用户区域设置，格式如 "zh-CN"。
-    if let Ok(output) = Command::new("reg")
-        .args(["query", r"HKCU\Control Panel\International", "/v", "LocaleName"])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if line.contains("LocaleName") {
-                let val = line.split_whitespace().last().unwrap_or("");
-                if val.to_lowercase().starts_with("zh") {
-                    return Lang::Zh;
-                } else {
-                    return Lang::En;
-                }
-            }
+    use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+    const LOCALE_NAME_MAX_LENGTH: usize = 85;
+    let mut buf = [0u16; LOCALE_NAME_MAX_LENGTH];
+    let n = unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
+    if n > 0 {
+        // 返回的长度含结尾的 NUL，去掉。
+        let name = String::from_utf16_lossy(&buf[..(n as usize).saturating_sub(1)]);
+        if name.to_lowercase().starts_with("zh") {
+            return Lang::Zh;
+        }
+        if !name.is_empty() {
+            return Lang::En;
         }
     }
     Lang::Zh
@@ -192,6 +192,9 @@ pub struct Texts {
     pub volume_presets_hint: &'static str,
     pub volume_preset_menu: &'static str,
     pub add: &'static str,
+    pub sort_by_name: &'static str,
+    pub sort_by_name_tip: &'static str,
+    pub hook_failed: &'static str,
     pub section_devices: &'static str,
     pub section_playback: &'static str,
     pub section_startup: &'static str,
@@ -289,6 +292,9 @@ impl Texts {
             volume_presets_hint: "右键任意音量滑块可以从这些档位里一键选择。拖动数字可改，✖ 删除，＋ 新增。",
             volume_preset_menu: "快速设置音量",
             add: "＋ 新增",
+            sort_by_name: "按名称排序",
+            sort_by_name_tip: "放弃手动顺序，按文件名重排。平时拖卡片左上角的手柄即可自由排序。",
+            hook_failed: "⚠ 全局热键未生效（只有窗口在前台时才能触发）",
             section_devices: "设备",
             section_playback: "播放",
             section_startup: "启动",
@@ -379,6 +385,9 @@ impl Texts {
             volume_presets_hint: "Right-click any volume slider to pick one of these. Drag a number to edit, ✖ removes, ＋ adds.",
             volume_preset_menu: "Set volume",
             add: "＋ Add",
+            sort_by_name: "Sort by name",
+            sort_by_name_tip: "Drop the manual order and sort by file name. Drag the grip at a card's top-left to reorder freely.",
+            hook_failed: "⚠ Global hotkeys are not active (they only work while this window is focused)",
             section_devices: "Devices",
             section_playback: "Playback",
             section_startup: "Startup",

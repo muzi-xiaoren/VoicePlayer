@@ -1,6 +1,10 @@
 //! 平台相关的小工具：开机自启、打开文件夹 / 网页。
 //! 非 Windows 平台提供空实现，保证跨平台可编译（本机 Mac 上开发时能过编译）。
 
+/// 起子进程时不要弹控制台窗口（否则会闪一下 cmd 黑窗）。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// VB-CABLE 官方下载页。
 pub const VBCABLE_URL: &str = "https://vb-audio.com/Cable/";
 
@@ -83,9 +87,11 @@ pub fn open_folder(path: &std::path::Path) {
 pub fn open_url(url: &str) {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         // 用 cmd 的 start；空标题参数 "" 不能省。
         let _ = std::process::Command::new("cmd")
             .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
     #[cfg(target_os = "macos")]
@@ -102,8 +108,10 @@ pub fn open_url(url: &str) {
 /// Users can assign per-app output devices here (e.g. route music player to CABLE Input).
 #[cfg(windows)]
 pub fn open_app_volume_settings() {
+    use std::os::windows::process::CommandExt;
     let _ = std::process::Command::new("cmd")
         .args(["/C", "start", "", "ms-settings:apps-volume"])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 }
 
