@@ -21,6 +21,8 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 rfd = "0.15"
+# 只为背景图解码；png 是 eframe 已经在用的特性，这里只额外多一个 jpeg。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

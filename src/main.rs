@@ -20,6 +20,8 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_min_inner_size([380.0, 460.0])
         .with_title("VoicePlayer")
+        // 透明必须在建窗时声明；之后运行时改的只是清除色的 alpha。
+        .with_transparent(true)
         .with_icon(std::sync::Arc::new(icon));
     match (cfg.window_w, cfg.window_h) {
         (Some(w), Some(h)) => viewport = viewport.with_inner_size([w, h]),

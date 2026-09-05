@@ -1,6 +1,6 @@
 //! egui 界面 + 状态管理，把配置、音频线程、热键、profile、i18n 串起来。
 use crate::audio::{self, AudioCmd, AudioCtl};
-use crate::config::{AppConfig, RepeatMode};
+use crate::config::{AppConfig, RepeatMode, ThemeMode};
 use crate::hotkeys::{self, HkAction, Hotkeys};
 use crate::i18n;
 use crate::platform;
@@ -38,6 +38,9 @@ struct Pending {
     reregister: bool,
     lock_toggled: bool,
     lang_changed: bool,
+    pick_bg_image: bool,
+    clear_bg_image: bool,
+    retheme: bool,
 }
 pub struct App {
     config: AppConfig,
@@ -55,6 +58,11 @@ pub struct App {
     /// 音效搜索关键字。
     search: String,
     page: Page,
+    /// 已加载的背景图纹理，以及它对应的文件路径（路径变了才重新解码）。
+    bg_tex: Option<egui::TextureHandle>,
+    bg_tex_path: Option<PathBuf>,
+    /// 上次上主题时的 (是否浅色, 自定义底色, 有无背景图)。变了才重新 apply。
+    theme_sig: Option<(bool, Option<[u8; 3]>, bool)>,
    last_scan: Instant,
    last_signature: Vec<String>,
    lang: i18n::Lang,
@@ -63,8 +71,13 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
        install_cjk_fonts(&cc.egui_ctx);
-        theme::apply(&cc.egui_ctx);
        let mut config = AppConfig::load();
+        theme::apply(
+            &cc.egui_ctx,
+            matches!(config.theme_mode, ThemeMode::Light),
+            config.bg_color,
+            config.bg_image.is_some(),
+        );
         let lang = i18n::resolve_lang(&config.language);
         let texts = i18n::Texts::new(lang);
         let out_devices = audio::output_devices();
@@ -114,6 +127,9 @@ impl App {
             show_new_profile: false,
             search: String::new(),
             page: Page::Sounds,
+            bg_tex: None,
+            bg_tex_path: None,
+            theme_sig: None,
            last_scan: Instant::now(),
            last_signature,
            lang,
@@ -203,6 +219,36 @@ impl App {
         self.profiles = Self::all_profiles(&self.config, self.texts().default_profile);
         self.switch_profile(&name);
     }
+    /// 每帧对一次主题：模式 / 底色 / 背景图任一变化就重新上样式。
+    /// 「跟随系统」也走这里，所以系统在运行中切深浅色能实时跟上。
+    fn sync_theme(&mut self, ctx: &egui::Context) {
+        let light = match self.config.theme_mode {
+            ThemeMode::Light => true,
+            ThemeMode::Dark => false,
+            ThemeMode::System => ctx
+                .system_theme()
+                .map(|t| t == egui::Theme::Light)
+                .unwrap_or(false),
+        };
+        theme::set_window_opacity(self.config.window_opacity);
+        let sig = (light, self.config.bg_color, self.config.bg_image.is_some());
+        if self.theme_sig != Some(sig) {
+            self.theme_sig = Some(sig);
+            theme::apply(ctx, light, self.config.bg_color, self.config.bg_image.is_some());
+        }
+        if self.config.bg_image != self.bg_tex_path {
+            self.bg_tex_path = self.config.bg_image.clone();
+            self.bg_tex = self
+                .config
+                .bg_image
+                .as_deref()
+                .and_then(|p| load_bg_texture(ctx, p));
+            if self.bg_tex.is_none() && self.bg_tex_path.is_some() {
+                log::warn!("背景图加载失败：{:?}", self.bg_tex_path);
+            }
+        }
+    }
+
     fn refresh_devices(&mut self) {
         self.out_devices = audio::output_devices();
         self.in_devices = audio::input_devices();
@@ -306,6 +352,7 @@ impl App {
     fn apply(&mut self, pending: Pending) {
        let texts = self.texts();
         let mut need_reregister = pending.reregister;
+        let mut need_retheme = pending.retheme;
         for (i, v) in pending.set_volume {
             if let Some(p) = self.profile.as_mut() {
                 if let Some(s) = p.sounds.get_mut(i) {
@@ -383,6 +430,24 @@ impl App {
                 }
             }
         }
+        if pending.pick_bg_image {
+            if let Some(f) = rfd::FileDialog::new()
+                .set_title(texts.bg_image_dialog_title)
+                .add_filter("image", &["png", "jpg", "jpeg"])
+                .pick_file()
+            {
+                self.config.bg_image = Some(f);
+                self.config.save();
+                need_retheme = true;
+            }
+        }
+        if pending.clear_bg_image {
+            self.config.bg_image = None;
+            self.bg_tex = None;
+            self.bg_tex_path = None;
+            self.config.save();
+            need_retheme = true;
+        }
         if pending.pick_folder {
             if let Some(dir) = rfd::FileDialog::new()
                 .set_title(texts.select_folder_dialog_title)
@@ -416,14 +481,14 @@ impl App {
         if need_reregister {
             self.reregister_hotkeys();
         }
+        let _ = need_retheme; // 主题变化由 update() 里的 sync_theme 统一检测
     }
     // ─────────────────────────── 顶栏 ───────────────────────────
     /// 应用名 + 页面切换 + 锁定 + 语言。
     fn ui_topbar(&mut self, ui: &mut egui::Ui, pending: &mut Pending) {
         let texts = self.texts();
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("🎚").size(18.0).color(theme::P.accent));
-            ui.label(egui::RichText::new(texts.title).size(16.0).strong().color(theme::P.text));
+            ui.label(egui::RichText::new(texts.title).size(16.0).strong().color(theme::p().accent));
             ui.add_space(10.0);
 
             // 分段控件式的页面切换
@@ -440,7 +505,7 @@ impl App {
                     .width(96.0)
                     .selected_text(self.lang.display())
                     .show_ui(ui, |ui| {
-                        ui.label(egui::RichText::new(texts.language).size(11.5).color(theme::P.dim));
+                        ui.label(egui::RichText::new(texts.language).size(11.5).color(theme::p().dim));
                         for l in i18n::Lang::all() {
                             if ui.selectable_value(&mut lang_sel, l, l.display()).changed() && l != self.lang {
                                 self.lang = l;
@@ -451,10 +516,12 @@ impl App {
 
                 // 锁定：锁上时用警告色，一眼能看出快捷键当前不响应
                 let (label, tip, color) = if self.config.locked {
-                    (texts.lock, texts.lock_tooltip, theme::P.warn)
+                    (texts.lock, texts.lock_tooltip, theme::p().warn)
                 } else {
-                    (texts.unlock, texts.unlock_tooltip, theme::P.dim)
+                    (texts.unlock, texts.unlock_tooltip, theme::p().dim)
                 };
+                // 用一个小圆点代替锁 emoji（字体里不一定有）
+                let dot = if self.config.locked { theme::p().warn } else { theme::p().ok };
                 let prev = self.config.locked;
                 if ui
                     .add(egui::Button::new(egui::RichText::new(label).color(color)).frame(false))
@@ -466,6 +533,8 @@ impl App {
                 if self.config.locked != prev {
                     pending.lock_toggled = true;
                 }
+                let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 4.0, dot);
             });
         });
     }
@@ -476,9 +545,9 @@ impl App {
         let texts = self.texts();
         ui.horizontal(|ui| {
             if self.vbcable {
-                theme::status_dot(ui, theme::P.ok, texts.vbcable_detected);
+                theme::status_dot(ui, theme::p().ok, texts.vbcable_detected);
             } else {
-                theme::status_dot(ui, theme::P.warn, texts.vbcable_not_detected);
+                theme::status_dot(ui, theme::p().warn, texts.vbcable_not_detected);
                 if ui.small_button(texts.open_vbcable_url).clicked() {
                     platform::open_url(platform::VBCABLE_URL);
                 }
@@ -494,8 +563,8 @@ impl App {
                 theme::badge(
                     ui,
                     &format!("▶ {} {}", texts.playing_now, n_playing),
-                    theme::P.accent,
-                    theme::P.accent_soft,
+                    theme::p().accent,
+                    theme::p().accent_soft,
                 );
             }
 
@@ -504,7 +573,7 @@ impl App {
                     self.audio.send(AudioCmd::StopAll);
                 }
                 if let Some(h) = &self.config.stop_hotkey {
-                    theme::badge(ui, &hotkeys::pretty_combo(h), theme::P.dim, theme::P.sunken);
+                    theme::badge(ui, &hotkeys::pretty_combo(h), theme::p().dim, theme::p().sunken);
                 }
                 ui.add_space(6.0);
                 ui.spacing_mut().slider_width = 110.0;
@@ -513,11 +582,22 @@ impl App {
                         .show_value(true)
                         .fixed_decimals(2),
                 );
-                if resp.changed() {
+                let picked = volume_preset_menu(
+                    &resp,
+                    &self.config.volume_presets.clone(),
+                    texts.volume_preset_menu,
+                    1.5,
+                );
+                if let Some(v) = picked {
+                    self.config.effect_volume = v;
+                }
+                if resp.changed() || picked.is_some() {
                     self.audio.send(AudioCmd::SetEffectVolume(self.config.effect_volume));
                     self.config.save();
                 }
-                ui.label(egui::RichText::new(texts.master_volume).size(12.0).color(theme::P.dim));
+                ui.label(egui::RichText::new(texts.master_volume).size(12.0).color(theme::p().dim));
+                // 右侧这组和左边的状态文字之间留出间距，否则会挤在一起
+                ui.add_space(16.0);
             });
         });
     }
@@ -529,6 +609,7 @@ impl App {
         profiles: &[String],
         sounds: &[Sound],
         playing: &std::collections::HashSet<PathBuf>,
+        presets: &[f32],
         pending: &mut Pending,
     ) {
         let texts = self.texts();
@@ -565,11 +646,18 @@ impl App {
                 })
                 .response
                 .on_hover_text(texts.profile);
-            if ui.button("📂").on_hover_text(texts.open_folder).clicked() {
+            if ui.button(texts.open_folder).clicked() {
                 pending.open_folder = true;
             }
-            if ui.button("📁").on_hover_text(texts.select_folder_tooltip).clicked() {
+            if ui.button(texts.add_folder).on_hover_text(texts.select_folder_tooltip).clicked() {
                 pending.pick_folder = true;
+            }
+            if ui
+                .selectable_label(self.show_new_profile, texts.create)
+                .on_hover_text(texts.new_profile_tooltip)
+                .clicked()
+            {
+                self.show_new_profile = !self.show_new_profile;
             }
             if is_external && ui.button("✖").on_hover_text(texts.remove_tooltip).clicked() {
                 pending.remove_external = self.config.active_profile.clone();
@@ -579,38 +667,31 @@ impl App {
                 ui.label(
                     egui::RichText::new(format!("{} {}", sounds.len(), texts.sound_count))
                         .size(12.0)
-                        .color(theme::P.dim),
+                        .color(theme::p().dim),
                 );
             });
         });
 
-        // ── 新建配置（默认收起，避免和常用操作抢位置）──
-        ui.horizontal(|ui| {
-            if ui
-                .selectable_label(self.show_new_profile, "＋")
-                .on_hover_text(texts.new_profile_tooltip)
-                .clicked()
-            {
-                self.show_new_profile = !self.show_new_profile;
-            }
-            if self.show_new_profile {
+        // ── 新建配置：默认收起，展开后单独占一行 ──
+        if self.show_new_profile {
+            ui.horizontal(|ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.new_profile_name)
-                        .desired_width(220.0)
+                        .desired_width(ui.available_width() - 80.0)
                         .hint_text(texts.new_profile_placeholder),
                 );
                 let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button(texts.create).clicked() || submit {
+                if ui.button(texts.confirm).clicked() || submit {
                     pending.new_profile = Some(self.new_profile_name.clone());
                 }
-            }
-            // 搜索框占满剩下的宽度
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .desired_width(ui.available_width())
-                    .hint_text(format!("🔍 {}", texts.search_placeholder)),
-            );
-        });
+            });
+        }
+        // ── 搜索：独占一行 ──
+        ui.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .desired_width(ui.available_width())
+                .hint_text(format!("🔍 {}", texts.search_placeholder)),
+        );
 
         ui.add_space(4.0);
 
@@ -631,23 +712,23 @@ impl App {
             return;
         }
 
-        // ── 瓦片网格：按可用宽度算列数，铺满不留空隙 ──
+        // ── 瓦片网格 ──
+        // 注意别用 horizontal_wrapped：子 ui 高度在分配时还不知道，光标会一个比一个往下漂，
+        // 同一排卡片会变成阶梯状。按列数切块 + ui.columns，列宽相等且顶边强制对齐。
         egui::ScrollArea::vertical().show(ui, |ui| {
             let spacing = ui.spacing().item_spacing.x;
             let avail = ui.available_width();
-            const MIN_TILE: f32 = 230.0;
-            let cols = (((avail + spacing) / (MIN_TILE + spacing)).floor()).max(1.0);
-            let tile_w = ((avail - spacing * (cols - 1.0)) / cols).floor().max(180.0);
+            const MIN_TILE: f32 = 240.0;
+            let cols = (((avail + spacing) / (MIN_TILE + spacing)).floor()).max(1.0) as usize;
 
-            ui.horizontal_wrapped(|ui| {
-                for (i, s) in visible {
-                    let is_playing = playing.contains(&s.path);
-                    ui.allocate_ui(egui::vec2(tile_w, 0.0), |ui| {
-                        ui.set_width(tile_w);
-                        self.ui_sound_tile(ui, i, s, is_playing, pending);
-                    });
-                }
-            });
+            for chunk in visible.chunks(cols) {
+                ui.columns(cols, |cui| {
+                    for (slot, (i, s)) in chunk.iter().enumerate() {
+                        let is_playing = playing.contains(&s.path);
+                        self.ui_sound_tile(&mut cui[slot], *i, s, is_playing, presets, pending);
+                    }
+                });
+            }
         });
     }
 
@@ -656,7 +737,7 @@ impl App {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
             ui.add(
-                egui::Label::new(egui::RichText::new(text).color(theme::P.dim))
+                egui::Label::new(egui::RichText::new(text).color(theme::p().dim))
                     .wrap_mode(egui::TextWrapMode::Wrap),
             );
         });
@@ -669,12 +750,14 @@ impl App {
         i: usize,
         s: &Sound,
         is_playing: bool,
+        presets: &[f32],
         pending: &mut Pending,
     ) {
         let texts = self.texts();
         theme::card(is_playing).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.vertical(|ui| {
+                ui.set_min_height(78.0);
                 // 第一行：播放 + 名字（正在播时名字用强调色）
                 ui.horizontal(|ui| {
                     if ui
@@ -684,9 +767,9 @@ impl App {
                         pending.play.push(i);
                     }
                     let name = egui::RichText::new(&s.name).strong().color(if is_playing {
-                        theme::P.accent
+                        theme::p().accent
                     } else {
-                        theme::P.text
+                        theme::p().text
                     });
                     ui.add(egui::Label::new(name).wrap_mode(egui::TextWrapMode::Truncate));
                 });
@@ -696,15 +779,15 @@ impl App {
                     let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
                     if capturing_this {
                         let btn = egui::Button::new(
-                            egui::RichText::new(texts.capturing_cancel).size(12.0).color(theme::P.text),
+                            egui::RichText::new(texts.capturing_cancel).size(12.0).color(theme::p().text),
                         )
-                        .fill(theme::P.accent);
+                        .fill(theme::p().accent);
                         ui.add(btn);
                     } else if let Some(h) = &s.hotkey {
                         let btn = egui::Button::new(
-                            egui::RichText::new(hotkeys::pretty_combo(h)).size(12.0).color(theme::P.text),
+                            egui::RichText::new(hotkeys::pretty_combo(h)).size(12.0).color(theme::p().text),
                         )
-                        .fill(theme::P.accent_soft);
+                        .fill(theme::p().accent_soft);
                         if ui.add(btn).on_hover_text(texts.set_hotkey).clicked() {
                             pending.capture = Some(CaptureTarget::Sound(i));
                         }
@@ -715,7 +798,7 @@ impl App {
                         let btn = egui::Button::new(
                             egui::RichText::new(format!("＋ {}", texts.set_hotkey_short))
                                 .size(12.0)
-                                .color(theme::P.dim),
+                                .color(theme::p().dim),
                         )
                         .frame(false);
                         if ui.add(btn).clicked() {
@@ -728,21 +811,25 @@ impl App {
                 ui.horizontal(|ui| {
                     let mut v = s.volume;
                     let mut changed: Option<f32> = None;
-                    let reset_w = if (v - 1.0).abs() > f32::EPSILON { 30.0 } else { 0.0 };
+                    let reset_w = if (v - 1.0).abs() > f32::EPSILON { 44.0 } else { 0.0 };
                     ui.spacing_mut().slider_width = (ui.available_width() - 56.0 - reset_w).max(60.0);
                     ui.push_id(("vol", i), |ui| {
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut v, 0.0..=2.0)
-                                    .show_value(true)
-                                    .fixed_decimals(2),
-                            )
-                            .changed()
-                        {
+                        let resp = ui.add(
+                            egui::Slider::new(&mut v, 0.0..=2.0)
+                                .show_value(true)
+                                .fixed_decimals(2),
+                        );
+                        if resp.changed() {
                             changed = Some(v);
                         }
+                        // 右键这条滑块 -> 档位快选
+                        if let Some(pv) =
+                            volume_preset_menu(&resp, presets, texts.volume_preset_menu, 2.0)
+                        {
+                            changed = Some(pv);
+                        }
                         if reset_w > 0.0
-                            && ui.small_button("↺").on_hover_text(texts.reset_volume_tooltip).clicked()
+                            && ui.small_button(texts.reset).on_hover_text(texts.reset_volume_tooltip).clicked()
                         {
                             changed = Some(1.0);
                         }
@@ -767,17 +854,104 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let w = ui.available_width();
 
+            // ── 外观 ──
+            theme::card(false).show(ui, |ui| {
+                ui.set_width(w - 26.0);
+                theme::section_title(ui, texts.section_appearance);
+                labeled_row(ui, texts.theme_mode, |ui| {
+                    let mut m = self.config.theme_mode;
+                    ui.selectable_value(&mut m, ThemeMode::System, texts.theme_system);
+                    ui.selectable_value(&mut m, ThemeMode::Dark, texts.theme_dark);
+                    ui.selectable_value(&mut m, ThemeMode::Light, texts.theme_light);
+                    if m != self.config.theme_mode {
+                        self.config.theme_mode = m;
+                        // 换模式时把自定义底色清掉，否则深色的底色会被带进浅色主题里
+                        self.config.bg_color = None;
+                        self.config.save();
+                    }
+                });
+                labeled_row(ui, texts.bg_color, |ui| {
+                    let light = self.theme_sig.map(|t| t.0).unwrap_or(false);
+                    let default_bg = if light {
+                        theme::DEFAULT_LIGHT_BG
+                    } else {
+                        theme::DEFAULT_DARK_BG
+                    };
+                    let mut rgb = self.config.bg_color.unwrap_or(default_bg);
+                    if ui.color_edit_button_srgb(&mut rgb).changed() {
+                        self.config.bg_color = Some(rgb);
+                        self.config.save();
+                    }
+                    if self.config.bg_color.is_some() && ui.small_button(texts.reset).clicked() {
+                        self.config.bg_color = None;
+                        self.config.save();
+                    }
+                });
+                labeled_row(ui, texts.bg_image, |ui| {
+                    if ui.button(texts.bg_image_pick).clicked() {
+                        pending.pick_bg_image = true;
+                    }
+                    match &self.config.bg_image {
+                        Some(p) => {
+                            if ui.small_button(texts.clear).clicked() {
+                                pending.clear_bg_image = true;
+                            }
+                            let name = p
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(name).size(12.0).color(theme::p().dim),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Truncate),
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new(texts.bg_image_none)
+                                    .size(12.0)
+                                    .color(theme::p().dim),
+                            );
+                        }
+                    }
+                });
+                let has_img = self.config.bg_image.is_some();
+                labeled_row(ui, texts.bg_opacity, |ui| {
+                    // 没设图片时置灰而不是藏起来，否则用户会以为没有这个设置
+                    if ui
+                        .add_enabled(
+                            has_img,
+                            egui::Slider::new(&mut self.config.bg_opacity, 0.0..=1.0).fixed_decimals(2),
+                        )
+                        .changed()
+                    {
+                        self.config.save();
+                    }
+                });
+                labeled_row_tip(ui, texts.window_opacity, Some(texts.window_opacity_hint), |ui| {
+                    if ui
+                        .add(egui::Slider::new(&mut self.config.window_opacity, 0.0..=1.0).fixed_decimals(2))
+                        .changed()
+                    {
+                        self.config.save();
+                    }
+                });
+                hint(ui, texts.appearance_hint, theme::p().dim);
+            });
+
             // ── 设备 ──
             theme::card(false).show(ui, |ui| {
                 ui.set_width(w - 26.0);
                 theme::section_title(ui, texts.section_devices);
-                labeled_row(ui, texts.output_device, |ui| {
+                labeled_row_tip(ui, texts.output_device, Some(texts.output_device_tip), |ui| {
                     device_combo(ui, "out", &mut self.config.output_device, out_devices, texts.system_default, &mut pending.rebuild_engine);
                 });
                 labeled_row(ui, texts.microphone, |ui| {
                     device_combo(ui, "in", &mut self.config.input_device, in_devices, texts.system_default, &mut pending.rebuild_engine);
                 });
-                labeled_row(ui, texts.monitor_device, |ui| {
+                labeled_row_tip(ui, texts.monitor_device, Some(texts.monitor_device_tip), |ui| {
                     device_combo(ui, "mon", &mut self.config.monitor_device, out_devices, texts.no_monitor, &mut pending.rebuild_engine);
                 });
                 if pending.rebuild_engine {
@@ -809,6 +983,44 @@ impl App {
                     changed |= ui.selectable_value(&mut self.config.repeat_mode, RepeatMode::Toggle, texts.repeat_toggle).clicked();
                     if changed {
                         self.audio.send(AudioCmd::SetRepeatMode(self.config.repeat_mode));
+                        self.config.save();
+                    }
+                });
+                labeled_row_tip(ui, texts.volume_presets, Some(texts.volume_presets_hint), |ui| {
+                    let mut remove: Option<usize> = None;
+                    let mut dirty = false;
+                    for i in 0..self.config.volume_presets.len() {
+                        ui.push_id(("preset", i), |ui| {
+                            let v = &mut self.config.volume_presets[i];
+                            if ui
+                                .add(
+                                    egui::DragValue::new(v)
+                                        .speed(0.05)
+                                        .range(0.0..=2.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            if ui.small_button("✖").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        self.config.volume_presets.remove(i);
+                        dirty = true;
+                    }
+                    if self.config.volume_presets.len() < 8 && ui.small_button(texts.add).clicked() {
+                        self.config.volume_presets.push(1.0);
+                        dirty = true;
+                    }
+                    if dirty {
+                        // 排序去重，菜单里才不会出现乱序和重复档位
+                        let p = &mut self.config.volume_presets;
+                        p.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        p.dedup_by(|a, b| (*a - *b).abs() < 0.005);
                         self.config.save();
                     }
                 });
@@ -851,16 +1063,16 @@ impl App {
                         }
                     });
                 }
-                hint(ui, texts.loopback_hint, theme::P.dim);
+                hint(ui, texts.loopback_hint, theme::p().dim);
                 if self.config.loopback_enabled
                     && self.config.monitor_device.is_some()
                     && audio::loopback_monitor_conflicts(self.config.monitor_device.as_deref())
                 {
-                    hint(ui, texts.loopback_monitor_conflict, theme::P.warn);
+                    hint(ui, texts.loopback_monitor_conflict, theme::p().warn);
                 }
                 ui.add_space(8.0);
                 theme::section_title(ui, texts.app_audio_routing);
-                hint(ui, texts.app_routing_hint, theme::P.dim);
+                hint(ui, texts.app_routing_hint, theme::p().dim);
                 if ui.button(texts.open_app_volume).clicked() {
                     platform::open_app_volume_settings();
                 }
@@ -882,7 +1094,7 @@ impl App {
             if let Some(err) = self.audio.last_error() {
                 theme::card(false).show(ui, |ui| {
                     ui.set_width(w - 26.0);
-                    ui.colored_label(theme::P.danger, format!("{}{err}", texts.audio_engine_error));
+                    ui.colored_label(theme::p().danger, format!("{}{err}", texts.audio_engine_error));
                     if ui.button(texts.retry).clicked() {
                         pending.rebuild_engine = true;
                     }
@@ -893,9 +1105,18 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// 窗口清除色。整窗不透明度 < 1 时，这里的 alpha 决定桌面透进来多少。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::clear_color()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 始终以 ~50ms 刷帧：保证快捷键触发响应及时（egui 后备触发依赖刷帧）。
         ctx.request_repaint_after(Duration::from_millis(50));
+        self.sync_theme(ctx);
+        if let Some(tex) = &self.bg_tex {
+            theme::paint_background(ctx, tex, self.config.bg_opacity);
+        }
         self.maybe_rescan();
         let was_capturing = self.capturing.is_some();
         self.handle_capture(ctx);
@@ -909,12 +1130,13 @@ impl eframe::App for App {
         let profiles = self.profiles.clone();
         let sounds = self.profile.as_ref().map(|p| p.sounds.clone()).unwrap_or_default();
         let playing = self.audio.playing_snapshot();
+        let presets = self.config.volume_presets.clone();
         let mut pending = Pending::default();
 
         egui::TopBottomPanel::top("topbar")
             .frame(
                 egui::Frame::none()
-                    .fill(theme::P.surface)
+                    .fill(theme::surface_fill())
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
             )
             .show(ctx, |ui| self.ui_topbar(ui, &mut pending));
@@ -922,7 +1144,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("statusbar")
             .frame(
                 egui::Frame::none()
-                    .fill(theme::P.surface)
+                    .fill(theme::surface_fill())
                     .inner_margin(egui::Margin::symmetric(12.0, 6.0)),
             )
             .show(ctx, |ui| self.ui_statusbar(ui, &mut pending));
@@ -930,11 +1152,13 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(theme::P.bg)
+                    .fill(theme::body_fill())
                     .inner_margin(egui::Margin::same(12.0)),
             )
             .show(ctx, |ui| match self.page {
-                Page::Sounds => self.ui_sounds(ui, &profiles, &sounds, &playing, &mut pending),
+                Page::Sounds => {
+                    self.ui_sounds(ui, &profiles, &sounds, &playing, &presets, &mut pending)
+                }
                 Page::Settings => self.ui_settings(ui, &out_devices, &in_devices, &mut pending),
             });
 
@@ -970,16 +1194,76 @@ impl eframe::App for App {
     }
 }
 
+/// 给一个音量滑块挂右键菜单，从预设档位里一键选。返回用户选中的值。
+fn volume_preset_menu(
+    resp: &egui::Response,
+    presets: &[f32],
+    title: &str,
+    max: f32,
+) -> Option<f32> {
+    let mut picked = None;
+    resp.context_menu(|ui| {
+        ui.label(egui::RichText::new(title).size(11.5).color(theme::p().dim));
+        for v in presets.iter().copied().filter(|v| *v <= max + f32::EPSILON) {
+            if ui.button(format!("{v:.2}")).clicked() {
+                picked = Some(v);
+                ui.close_menu();
+            }
+        }
+    });
+    picked
+}
+
 /// 设置页里的一行：左侧固定宽度的标签 + 右侧控件，多行之间左边缘对齐。
 fn labeled_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    labeled_row_tip(ui, label, None, add);
+}
+
+/// 带说明的版本：标签保持短，长解释挂在悬停提示里（写进标签会被截断）。
+fn labeled_row_tip(
+    ui: &mut egui::Ui,
+    label: &str,
+    tip: Option<&str>,
+    add: impl FnOnce(&mut egui::Ui),
+) {
     ui.horizontal(|ui| {
-        ui.add_sized(
-            egui::vec2(132.0, 20.0),
-            egui::Label::new(egui::RichText::new(label).color(theme::P.dim))
+        let text = if tip.is_some() {
+            format!("{label} ⓘ")
+        } else {
+            label.to_string()
+        };
+        let resp = ui.add_sized(
+            egui::vec2(120.0, 20.0),
+            egui::Label::new(egui::RichText::new(text).color(theme::p().dim))
                 .wrap_mode(egui::TextWrapMode::Truncate),
         );
+        if let Some(t) = tip {
+            resp.on_hover_text(t);
+        }
         add(ui);
     });
+}
+
+/// 解码一张背景图并上传成纹理。太大的图先缩到 2560 宽，避免白占显存。
+fn load_bg_texture(ctx: &egui::Context, path: &std::path::Path) -> Option<egui::TextureHandle> {
+    let img = match image::open(path) {
+        Ok(i) => i,
+        Err(e) => {
+            log::warn!("解码背景图失败 {}：{e}", path.display());
+            return None;
+        }
+    };
+    const MAX_W: u32 = 2560;
+    let img = if img.width() > MAX_W {
+        let h = (img.height() as f32 * MAX_W as f32 / img.width() as f32).round() as u32;
+        img.resize(MAX_W, h.max(1), image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    Some(ctx.load_texture("bg", ci, egui::TextureOptions::LINEAR))
 }
 
 /// 一段会自动换行的小字说明。

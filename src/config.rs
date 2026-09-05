@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// 界面主题。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ThemeMode {
+    /// 跟随系统的深色 / 浅色设置。
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
 /// 重复按同一个快捷键时的行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RepeatMode {
@@ -73,6 +83,20 @@ pub struct AppConfig {
     pub loopback_name: Option<String>,
     pub loopback_enabled: bool,
     pub loopback_volume: f32,
+    /// 深色 / 浅色 / 跟随系统。
+    pub theme_mode: ThemeMode,
+    /// 自定义背景色（sRGB）。None = 用当前主题的默认底色。
+    /// 卡片、输入框、描边的明暗都由它推出来。
+    pub bg_color: Option<[u8; 3]>,
+    /// 背景图片路径。None = 不用背景图。
+    pub bg_image: Option<PathBuf>,
+    /// 背景图片不透明度 0.0–1.0。
+    pub bg_opacity: f32,
+    /// 音量快速档位。右键音量滑块时弹出来供一键选择，可在设置里增删改。
+    pub volume_presets: Vec<f32>,
+    /// 整个窗口的不透明度 0.0–1.0。1.0 = 完全不透明；0.0 = 底完全透明，
+    /// 只剩文字和控件浮在桌面上（它们始终不透明，所以窗口不会真的消失）。
+    pub window_opacity: f32,
     pub window_x: Option<f32>,
     pub window_y: Option<f32>,
     pub window_w: Option<f32>,
@@ -98,6 +122,12 @@ impl Default for AppConfig {
             loopback_name: None,
             loopback_enabled: false,
             loopback_volume: 1.0,
+            theme_mode: ThemeMode::default(),
+            bg_color: None,
+            bg_image: None,
+            bg_opacity: 0.35,
+            volume_presets: vec![0.1, 0.5, 0.8, 1.0, 1.2, 1.5],
+            window_opacity: 1.0,
             window_x: None,
             window_y: None,
             window_w: None,
