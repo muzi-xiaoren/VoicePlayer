@@ -57,12 +57,28 @@ pub fn default_output_name() -> Option<String> {
         .and_then(|d| d.name().ok())
 }
 
-/// 监听设备是否就是环回捕获源（此时不能把捕获到的系统声音再送进监听，否则啸叫）。
-pub fn loopback_monitor_conflicts(monitor_device: Option<&str>) -> bool {
-    match (monitor_device, default_output_name()) {
-        (Some(m), Some(d)) => m == d,
+/// 两个设备设置是不是指向同一个物理设备（None 都表示「系统默认播放设备」）。
+///
+/// 环回捕获的两条回授都靠它挡：
+/// - 捕获源 == 主输出（CABLE Input）→ 抓到的声音又送回 CABLE，滚成啸叫；
+/// - 捕获源 == 监听设备（耳机）→ 同理。
+pub fn same_output(a: Option<&str>, b: Option<&str>) -> bool {
+    let def = default_output_name();
+    let resolve = |x: Option<&str>| -> Option<String> {
+        match x {
+            Some(n) if !n.trim().is_empty() => Some(n.to_string()),
+            _ => def.clone(),
+        }
+    };
+    match (resolve(a), resolve(b)) {
+        (Some(x), Some(y)) => x == y,
         _ => false,
     }
+}
+
+/// 监听设备是否就是环回捕获源（此时不能把捕获到的系统声音再送进监听，否则啸叫）。
+pub fn loopback_monitor_conflicts(monitor_device: Option<&str>, capture_device: Option<&str>) -> bool {
+    monitor_device.is_some() && same_output(monitor_device, capture_device)
 }
 
 /// 猜一个默认应该选的输出设备名：优先 VB-CABLE 的 CABLE Input。
@@ -351,19 +367,25 @@ impl AudioEngine {
             cfg.loopback_volume.to_bits(),
         ));
         let _loopback_thread: Option<std::thread::JoinHandle<()>> = if cfg.loopback_enabled {
+            let cap = cfg.capture_device.as_deref();
             let buf = LoopbackBuf::new();
-            // 主输出（虚拟麦克风）
-            let lb_src = LoopbackSource {
-                buf: buf.clone(),
-                vol: loopback_vol.clone(),
-                monitor: false,
-            };
-            if let Err(e) = out_handle.play_raw(lb_src) {
-                log::warn!("loopback play_raw: {e}");
+            // 主输出（虚拟麦克风）。捕获源就是主输出时不能送，否则自己抓自己滚成啸叫 ——
+            // 「把网易云单独指到 CABLE Input」的玩法就会命中这一条：
+            // 声音本来就已经在 CABLE 里了，队友听得到，这边只需要给自己开监听。
+            if same_output(cap, cfg.output_device.as_deref()) {
+                log::info!("环回捕获源就是主输出设备，跳过转发到麦克风（声音已经在这条链路上了）");
+            } else {
+                let lb_src = LoopbackSource {
+                    buf: buf.clone(),
+                    vol: loopback_vol.clone(),
+                    monitor: false,
+                };
+                if let Err(e) = out_handle.play_raw(lb_src) {
+                    log::warn!("loopback play_raw: {e}");
+                }
             }
-            // 监听（耳机）：只有监听设备和环回捕获源不是同一个设备时才送，
-            // 否则「放出去的声音又被抓回来」会滚成啸叫。
-            match (&mon_handle, loopback_monitor_conflicts(cfg.monitor_device.as_deref())) {
+            // 监听（耳机）：只有监听设备和环回捕获源不是同一个设备时才送。
+            match (&mon_handle, loopback_monitor_conflicts(cfg.monitor_device.as_deref(), cap)) {
                 (Some(h), false) => {
                     buf.mon_enabled.store(true, Ordering::Relaxed);
                     let lb_mon = LoopbackSource {
@@ -377,11 +399,15 @@ impl AudioEngine {
                     }
                 }
                 (Some(_), true) => log::info!(
-                    "监听设备就是系统默认播放设备，跳过环回监听（避免回授啸叫）"
+                    "监听设备就是环回捕获源，跳过环回监听（避免回授啸叫）"
                 ),
                 (None, _) => {}
             }
-            Some(wasapi_loopback::start_loopback_thread(buf, loopback_stop.clone()))
+            Some(wasapi_loopback::start_loopback_thread(
+                buf,
+                loopback_stop.clone(),
+                cfg.capture_device.clone(),
+            ))
         } else {
             None
         };

@@ -139,8 +139,19 @@ pub fn pretty_combo(combo: &str) -> String {
         .unwrap_or_else(|| combo.to_string())
 }
 // ─── 共享状态 ───
+/// 触发来源。两条路都可能收到同一次按键，去重要区分来源。
+#[derive(Clone, Copy, PartialEq)]
+pub enum Src {
+    /// 低级键盘钩子（全局，窗口在后台也能收到）。
+    Hook,
+    /// egui 键盘事件（只有窗口在前台时有）。
+    Egui,
+}
+
 struct HookShared {
-    actions: Mutex<HashMap<u32, HkAction>>,
+    /// 绑定表。回调里**只在锁内 clone 一次 Arc**就放锁，
+    /// 绝不在持锁状态下派发动作 —— 低级钩子回调卡住会被系统摘钩。
+    actions: Mutex<Arc<HashMap<u32, HkAction>>>,
     locked: AtomicBool,
     capturing: AtomicBool,
     capture_tx: Mutex<Option<Sender<Option<(u8, u32)>>>>,
@@ -148,8 +159,16 @@ struct HookShared {
     hook_installed: AtomicBool,
     /// Hotkeys 句柄还活着。回调只读这个原子量，不需要锁。
     active: AtomicBool,
-    dedup_key: AtomicU32,
-    dedup_time: AtomicU64,
+    /// 钩子路径最近一次触发的 (combo, 时刻)，只给 egui 后备路径做去重用。
+    hook_fire_key: AtomicU32,
+    hook_fire_time: AtomicU64,
+    // ── 诊断（设置页显示，方便远程排查「热键突然不响」）──
+    /// 钩子回调最近一次收到任意键盘事件的时刻。
+    last_event: AtomicU64,
+    /// 钩子回调累计收到的键盘事件数。一直是 0 = 钩子根本没在工作。
+    event_count: AtomicU64,
+    /// 钩子被重装过几次（自愈次数）。
+    reinstalls: AtomicU32,
 }
 /// 钩子回调要用到的共享状态。回调是**系统级热路径**（每一次按键都会走），
 /// 所以这里用 OnceLock 而不是 Mutex：回调里不加锁，避免被 UI 线程卡住 ——
@@ -166,15 +185,18 @@ impl Hotkeys {
         F: Fn(HkAction) + Send + Sync + 'static,
     {
         let shared = Arc::new(HookShared {
-            actions: Mutex::new(HashMap::new()),
+            actions: Mutex::new(Arc::new(HashMap::new())),
             locked: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
             capture_tx: Mutex::new(None),
             on_action: Arc::new(on_action),
             hook_installed: AtomicBool::new(false),
             active: AtomicBool::new(true),
-            dedup_key: AtomicU32::new(0),
-            dedup_time: AtomicU64::new(0),
+            hook_fire_key: AtomicU32::new(u32::MAX),
+            hook_fire_time: AtomicU64::new(0),
+            last_event: AtomicU64::new(0),
+            event_count: AtomicU64::new(0),
+            reinstalls: AtomicU32::new(0),
         });
         #[cfg(windows)]
         {
@@ -200,12 +222,12 @@ impl Hotkeys {
             }
         }
         if let Ok(mut a) = self.shared.actions.lock() {
-            *a = map;
+            *a = Arc::new(map);
         }
     }
     pub fn clear(&self) {
         if let Ok(mut a) = self.shared.actions.lock() {
-            a.clear();
+            *a = Arc::new(HashMap::new());
         }
     }
     pub fn set_locked(&self, locked: bool) {
@@ -235,9 +257,23 @@ impl Hotkeys {
     pub fn hook_installed(&self) -> bool {
         self.shared.hook_installed.load(Ordering::Relaxed)
     }
-    /// 用 VK code 直接触发（egui 后备路径调用）。
+    /// 钩子回调累计收到的键盘事件数。装上了但这个数一直不涨 = 钩子实际没在工作
+    /// （典型原因：前台程序是管理员权限运行的，本程序不是）。
+    pub fn event_count(&self) -> u64 {
+        self.shared.event_count.load(Ordering::Relaxed)
+    }
+    /// 距上一次收到键盘事件过去了多少毫秒。从没收到过时返回 None。
+    pub fn idle_ms(&self) -> Option<u64> {
+        let t = self.shared.last_event.load(Ordering::Relaxed);
+        (t != 0).then(|| now_ms().saturating_sub(t))
+    }
+    /// 钩子自愈重装了几次。
+    pub fn reinstalls(&self) -> u32 {
+        self.shared.reinstalls.load(Ordering::Relaxed)
+    }
+    /// 用 VK code 直接触发（egui 前台后备路径调用）。
     pub fn trigger_from_vk(&self, mods: u8, vk: u32) {
-        self.shared.fire_if_bound(mods, vk);
+        self.shared.fire(mods, vk, Src::Egui);
     }
 }
 
@@ -250,24 +286,38 @@ fn now_ms() -> u64 {
 }
 
 impl HookShared {
-    /// 查找绑定并触发动作。内置锁定检查 + 去重（防止钩子和 egui 同时触发同一按键）。
-    fn fire_if_bound(&self, mods: u8, vk: u32) {
+    /// 查找绑定并触发动作。
+    ///
+    /// 去重是**按来源**做的，不是按时间窗一刀切：
+    /// - 钩子路径永远直接触发（自动重复已经在回调里用 DOWN_KEYS 挡掉了），
+    ///   所以连按多快都不丢音；
+    /// - egui 前台路径只在「钩子刚刚为同一个键触发过」时才跳过。
+    ///
+    /// 这样两条路可以同时开着：钩子活着时前台不会重复触发，
+    /// 钩子被系统摘掉时前台还能兜住 —— 上一版把前台路径整个关掉，
+    /// 钩子一死就变成前后台全哑。
+    fn fire(&self, mods: u8, vk: u32, src: Src) {
         if self.locked.load(Ordering::Relaxed) {
             return;
         }
         let key = combo_key(mods, vk);
         let now = now_ms();
-        let prev_key = self.dedup_key.load(Ordering::Relaxed);
-        let prev_time = self.dedup_time.load(Ordering::Relaxed);
-        // 只用来挡「钩子和 egui 后备路径撞同一次按键」，不是用来限制连按频率的。
-        // 原来是 300ms，会把 300ms 内的连按整个吃掉，
-        // 「叠加再播」那种模式下手速快一点就丢音。
-        if prev_key == key && now.saturating_sub(prev_time) < 40 {
-            return;
+        match src {
+            Src::Hook => {
+                self.hook_fire_key.store(key, Ordering::Relaxed);
+                self.hook_fire_time.store(now, Ordering::Relaxed);
+            }
+            Src::Egui => {
+                let hk = self.hook_fire_key.load(Ordering::Relaxed);
+                let ht = self.hook_fire_time.load(Ordering::Relaxed);
+                if hk == key && now.saturating_sub(ht) < 300 {
+                    return; // 同一次按键钩子已经处理过了
+                }
+            }
         }
-        self.dedup_key.store(key, Ordering::Relaxed);
-        self.dedup_time.store(now, Ordering::Relaxed);
-        if let Some(action) = self.actions.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        // 锁只用来 clone 一个 Arc，立刻释放；派发在锁外做。
+        let map = self.actions.lock().ok().map(|g| Arc::clone(&g));
+        if let Some(action) = map.and_then(|m| m.get(&key).cloned()) {
             (self.on_action)(action);
         }
     }
@@ -288,7 +338,7 @@ mod win {
    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+        GetMessageW, KillTimer, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
         HHOOK, MSG, WH_KEYBOARD_LL,
     };
     // hook_callback 在父模块里用到这两个，所以 pub(super)
@@ -313,13 +363,58 @@ mod win {
         }
         Some(hook)
     }
-    pub(super) unsafe fn run_message_loop() {
+    /// 消息循环 + 看门狗。
+    ///
+    /// 低级钩子被系统摘掉（回调超时、会话切换、某些安全软件）时**不会有任何通知**，
+    /// `SetWindowsHookExW` 返回的句柄照样非空，程序自己完全察觉不到 ——
+    /// 表现就是「用着用着热键突然不响，重启才好」。
+    /// 所以这里挂一个 1.5 秒的定时器：一段时间内一个键盘事件都没收到，
+    /// 就当钩子已经死了，摘掉重装一次。装得上就自动恢复，不用重启。
+    pub(super) unsafe fn run_message_loop(shared: &std::sync::Arc<super::HookShared>, hook: &mut HHOOK) {
+        use std::sync::atomic::Ordering;
+        const WM_TIMER: u32 = 0x0113;
+        /// 多久没有任何键盘事件就重装一次钩子。
+        const IDLE_REINSTALL_MS: u64 = 3_000;
+
+        let timer = SetTimer(std::ptr::null_mut(), 0, 1_500, None);
         let mut msg: MSG = std::mem::zeroed();
+        let mut errors = 0u32;
         loop {
-            let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0); // HWND=isize，传 0 = 线程全部窗口
-            if ret == 0 || ret == -1 {
-                break;
+            let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0); // HWND=null = 本线程所有消息
+            if ret == 0 {
+                break; // WM_QUIT
             }
+            if ret == -1 {
+                // 取消息出错。以前这里直接 break，线程一退钩子就永久没了，
+                // 而且外面完全看不出来 —— 现在只记一笔继续跑，连续错太多才放弃。
+                errors += 1;
+                log::warn!("GetMessageW 返回 -1（第 {errors} 次）");
+                if errors > 32 {
+                    break;
+                }
+                continue;
+            }
+            if msg.message != WM_TIMER {
+                continue;
+            }
+            let idle = super::now_ms().saturating_sub(shared.last_event.load(Ordering::Relaxed));
+            if idle < IDLE_REINSTALL_MS {
+                continue; // 还在收键盘事件，钩子活得好好的
+            }
+            UnhookWindowsHookEx(*hook);
+            match install_hook() {
+                Some(h) => {
+                    *hook = h;
+                    shared.hook_installed.store(true, Ordering::Relaxed);
+                }
+                None => shared.hook_installed.store(false, Ordering::Relaxed),
+            }
+            shared.reinstalls.fetch_add(1, Ordering::Relaxed);
+            // 顶一下时间戳，否则下一个 tick 会立刻再重装一次。
+            shared.last_event.store(super::now_ms(), Ordering::Relaxed);
+        }
+        if timer != 0 {
+            KillTimer(std::ptr::null_mut(), timer);
         }
     }
     pub(super) unsafe fn remove_hook(hook: HHOOK) {
@@ -363,6 +458,9 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
         let is_up = wparam == win::WM_KEYUP || wparam == win::WM_SYSKEYUP;
         if is_down || is_up {
             if let Some(shared) = SHARED.get().filter(|s| s.active.load(Ordering::Relaxed)) {
+                // 心跳：看门狗靠它判断「钩子是不是已经被系统悄悄摘掉了」。
+                shared.event_count.fetch_add(1, Ordering::Relaxed);
+                shared.last_event.store(now_ms(), Ordering::Relaxed);
                 if shared.capturing.load(Ordering::Relaxed) {
                     if is_down && !is_modifier_key(vk) {
                         let result = if vk == VK_ESCAPE { None } else { Some((win::get_modifiers(), vk)) };
@@ -390,7 +488,7 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
                             dk.insert(vk, now).is_some()
                         });
                         if !already_down {
-                            shared.fire_if_bound(mods, vk);
+                            shared.fire(mods, vk, Src::Hook);
                         }
                     } else if is_up {
                         DOWN_KEYS.with(|dk| { dk.borrow_mut().remove(&vk); });
@@ -415,7 +513,7 @@ thread_local! {
 fn hook_thread(shared: Arc<HookShared>) {
     let _ = SHARED.set(shared.clone());
     unsafe {
-        let hook = match win::install_hook() {
+        let mut hook = match win::install_hook() {
             Some(h) => h,
             None => {
                 shared.active.store(false, Ordering::Relaxed);
@@ -424,8 +522,9 @@ fn hook_thread(shared: Arc<HookShared>) {
         };
         shared.hook_installed.store(true, Ordering::Relaxed);
         log::info!("低级键盘钩子已安装");
-        win::run_message_loop();
+        win::run_message_loop(&shared, &mut hook);
         win::remove_hook(hook);
+        shared.hook_installed.store(false, Ordering::Relaxed);
         log::info!("低级键盘钩子已卸载");
     }
     shared.active.store(false, Ordering::Relaxed);

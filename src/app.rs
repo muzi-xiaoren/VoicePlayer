@@ -1,6 +1,6 @@
 //! egui 界面 + 状态管理，把配置、音频线程、热键、profile、i18n 串起来。
 use crate::audio::{self, AudioCmd, AudioCtl};
-use crate::config::{AppConfig, RepeatMode, ThemeMode};
+use crate::config::{AppConfig, RepeatMode, SortMode, ThemeMode, ViewMode};
 use crate::hotkeys::{self, HkAction, Hotkeys};
 use crate::i18n;
 use crate::platform;
@@ -8,12 +8,35 @@ use crate::profile::{self, Profile, Sound};
 use crate::theme;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-/// 音效瓦片的固定高度。三行内容 + 卡片内边距，所有卡片一样高，排版才齐。
+/// 网格模式下音效瓦片的固定高度。三行内容 + 卡片内边距，所有卡片一样高，排版才齐。
 const TILE_H: f32 = 108.0;
+/// 网格模式下瓦片的最小宽度，用它算一行能放几列。
+const TILE_W_MIN: f32 = 240.0;
+/// 列表模式下每行的高度。
+const ROW_H: f32 = 46.0;
+/// 长按多久（秒）开始拖动。太短会和点击/拖滑块打架，太长手感发黏。
+const LONG_PRESS: f64 = 0.32;
+/// 长按判定期间允许的手指抖动（像素）。超过就当成是在操作控件，不进入拖动。
+const LONG_PRESS_SLOP: f32 = 6.0;
+/// 卡片归位动画时长（秒）。
+const REFLOW_TIME: f32 = 0.13;
 
-/// 拖动排序时带的载荷：被拖走的那一项的下标。
+/// 拖动排序的实时状态。
+///
+/// 放在 `App` 上而不是 egui 的 DragAndDrop 里，是因为要自己算「现在会插到第几格」，
+/// 才能让其他卡片**实时让位**（egui 自带的拖放只有一个高亮框，没有让位动画）。
 #[derive(Clone, Copy)]
-struct DragSound(usize);
+struct DragState {
+    /// 被按住那一项在 `profile.sounds` 里的下标。
+    from: usize,
+    /// 指针相对卡片左上角的偏移。拖起来时卡片不会跳到指针底下。
+    grab: egui::Vec2,
+    /// 是否已经越过长按阈值、真正进入拖动。
+    active: bool,
+    /// 按下的时刻（`ctx.input().time`）和位置，用来判长按。
+    press_at: f64,
+    press_pos: egui::Pos2,
+}
 
 /// 界面分页。设置项从主界面挪走，音效列表才是主角。
 #[derive(Clone, Copy, PartialEq)]
@@ -47,7 +70,10 @@ struct Pending {
     lang_changed: bool,
     /// 把第 .0 项移动到第 .1 项的位置。
     reorder: Option<(usize, usize)>,
-    sort_by_name: bool,
+    sort_mode: Option<SortMode>,
+    view_mode: Option<ViewMode>,
+    /// 这一帧有人按住了第 N 项的拖动手柄。
+    grip_pressed: Option<usize>,
     pick_bg_image: bool,
     clear_bg_image: bool,
     retheme: bool,
@@ -73,7 +99,11 @@ pub struct App {
     bg_tex_path: Option<PathBuf>,
     /// 上次上主题时的 (是否浅色, 自定义底色, 有无背景图)。变了才重新 apply。
     theme_sig: Option<(bool, Option<[u8; 3]>, bool)>,
+    /// 拖动排序状态。渲染走 `&self`，所以用 RefCell 装。
+    drag: std::cell::RefCell<Option<DragState>>,
    last_scan: Instant,
+   /// 进程启动时刻。用来判断「开了这么久还一个按键都没收到」= 钩子被挡了。
+   started: Instant,
    last_signature: Vec<String>,
    lang: i18n::Lang,
     last_window_save: Instant,
@@ -105,7 +135,11 @@ impl App {
         config.active_profile = active.clone();
         let profile = active
             .as_deref()
-            .map(|n| Profile::load(n, &Self::dir_for_config(&config, n)));
+            .map(|n| {
+                let mut p = Profile::load(n, &Self::dir_for_config(&config, n));
+                p.apply_sort(config.sort_mode);
+                p
+            });
         let last_signature = profile
             .as_ref()
             .map(|p| Profile::file_signature(&p.dir))
@@ -140,7 +174,9 @@ impl App {
             bg_tex: None,
             bg_tex_path: None,
             theme_sig: None,
+            drag: std::cell::RefCell::new(None),
            last_scan: Instant::now(),
+           started: Instant::now(),
            last_signature,
            lang,
             last_window_save: Instant::now(),
@@ -196,7 +232,8 @@ impl App {
     fn switch_profile(&mut self, name: &str) {
         self.config.active_profile = Some(name.to_string());
         let dir = self.dir_for(name);
-        let p = Profile::load(name, &dir);
+        let mut p = Profile::load(name, &dir);
+        p.apply_sort(self.config.sort_mode);
         self.last_signature = Profile::file_signature(&p.dir);
         self.profile = Some(p);
         self.config.save();
@@ -274,7 +311,9 @@ impl App {
             let sig = Profile::file_signature(&dir);
             if sig != self.last_signature {
                 self.last_signature = sig;
-                self.profile = Some(Profile::load(&name, &dir));
+                let mut p = Profile::load(&name, &dir);
+                p.apply_sort(self.config.sort_mode);
+                self.profile = Some(p);
                 self.reregister_hotkeys();
             }
         }
@@ -338,16 +377,17 @@ impl App {
        });
        captured
    }
-    /// 窗口有焦点时用 egui 键盘事件触发快捷键。**仅在低级钩子没装上时才走这条路** ——
-    /// 钩子正常时它是全局生效的，再叠一条只会制造重复触发。
+    /// 窗口有焦点时用 egui 键盘事件触发快捷键。
+    ///
+    /// 这条路**永远开着**，它是钩子的保险丝：钩子被系统悄悄摘掉时，
+    /// 至少前台还能用。重复触发由 `Hotkeys` 内部按来源去重挡掉
+    /// （钩子刚为同一个键触发过，这里就跳过），不需要在这里关掉整条路 ——
+    /// 上一版就是关掉了它，钩子一死就变成前后台全哑。
     fn poll_egui_trigger(&self, ctx: &egui::Context) {
         if self.capturing.is_some() {
             return;
         }
         let Some(hk) = self.hotkeys.as_ref() else { return };
-        if hk.hook_installed() {
-            return;
-        }
         ctx.input(|input| {
             for event in &input.events {
                 if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event {
@@ -449,14 +489,26 @@ impl App {
                 p.move_sound(from, to);
                 p.save_bindings();
             }
+            // 手动拖过一次，排序方式就变成「自定义」—— 否则下次重排会把手动顺序冲掉。
+            if self.config.sort_mode != SortMode::Custom {
+                self.config.sort_mode = SortMode::Custom;
+                self.config.save();
+            }
             need_reregister = true;
         }
-        if pending.sort_by_name {
+        if let Some(m) = pending.sort_mode {
+            self.config.sort_mode = m;
+            self.config.save();
             if let Some(p) = self.profile.as_mut() {
-                p.sort_by_name();
+                p.apply_sort(m);
+                // 顺手把新顺序落盘：之后切到「自定义」还是这个顺序，不会跳回去。
                 p.save_bindings();
             }
             need_reregister = true;
+        }
+        if let Some(v) = pending.view_mode {
+            self.config.view_mode = v;
+            self.config.save();
         }
         if pending.pick_bg_image {
             if let Some(f) = rfd::FileDialog::new()
@@ -572,10 +624,22 @@ impl App {
     fn ui_statusbar(&mut self, ui: &mut egui::Ui, pending: &mut Pending) {
         let texts = self.texts();
         ui.horizontal(|ui| {
-            let hook_ok = self.hotkeys.as_ref().map(|h| h.hook_installed()).unwrap_or(false);
-            if !hook_ok {
-                theme::status_dot(ui, theme::p().danger, texts.hook_failed);
-                ui.separator();
+            // 钩子没装上 = 全局热键彻底没有；装上了但开了半天一个键都没收到
+            // = 被系统挡住了（多半是前台程序以管理员权限运行）。两种都要让用户看见，
+            // 否则表现都是「按了没反应」，而且只有前台还能用，很容易误判成没坏。
+            match self.hotkeys.as_ref() {
+                Some(h) if !h.hook_installed() => {
+                    theme::status_dot(ui, theme::p().danger, texts.hook_failed);
+                    ui.separator();
+                }
+                Some(h)
+                    if h.event_count() == 0
+                        && self.started.elapsed() >= Duration::from_secs(30) =>
+                {
+                    theme::status_dot(ui, theme::p().warn, texts.hook_blocked);
+                    ui.separator();
+                }
+                _ => {}
             }
             if self.vbcable {
                 theme::status_dot(ui, theme::p().ok, texts.vbcable_detected);
@@ -697,12 +761,33 @@ impl App {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(texts.sort_by_name)
-                    .on_hover_text(texts.sort_by_name_tip)
-                    .clicked()
-                {
-                    pending.sort_by_name = true;
+                // 排序方式：选到「自定义」以外的档位会立刻重排；拖过卡片会自动切回自定义。
+                let mut mode = self.config.sort_mode;
+                egui::ComboBox::from_id_salt("sortmode")
+                    .width(112.0)
+                    .selected_text(texts.sort_label(mode))
+                    .show_ui(ui, |ui| {
+                        for m in [
+                            SortMode::NameAsc,
+                            SortMode::NameDesc,
+                            SortMode::TimeAsc,
+                            SortMode::TimeDesc,
+                            SortMode::Custom,
+                        ] {
+                            ui.selectable_value(&mut mode, m, texts.sort_label(m));
+                        }
+                    })
+                    .response
+                    .on_hover_text(texts.sort_tip);
+                if mode != self.config.sort_mode {
+                    pending.sort_mode = Some(mode);
+                }
+                // 网格 / 列表
+                let mut view = self.config.view_mode;
+                ui.selectable_value(&mut view, ViewMode::List, texts.view_list);
+                ui.selectable_value(&mut view, ViewMode::Grid, texts.view_grid);
+                if view != self.config.view_mode {
+                    pending.view_mode = Some(view);
                 }
                 ui.label(
                     egui::RichText::new(format!("{} {}", sounds.len(), texts.sound_count))
@@ -752,40 +837,178 @@ impl App {
             return;
         }
 
-        // ── 瓦片网格 ──
-        // 这里不能用 horizontal_wrapped（子 ui 高度未知，光标会逐个下漂成阶梯），
-        // 也不能用 ui.columns —— columns_dyn 会按「最宽的一列」推进父 ui 的光标
-        // （源码里那句 "Make sure we fit everything next frame"），只要某列内容顶到列宽，
-        // 滚动区的内容宽度就会一帧帧往外长，表现就是右边被裁掉、每排还不一样宽。
+        // ── 布局：自己算位置 + 动画归位 ──
         //
-        // 改成：宽度只算一次（滚动条的位置先扣掉），每张卡片按固定尺寸 allocate，
-        // 内部再 set_max_width 封死，任何内容都撑不出格子。
-        let spacing = ui.spacing().item_spacing.x;
+        // 不用 egui 的流式布局，是因为要做「拖动时其他卡片实时让位」：
+        // 每一项的目标位置由它在**当前显示顺序**里的槽位算出来，
+        // 实际画的位置用 animate_value_with_time 从旧位置插值过去，
+        // 于是拖动经过谁，谁就滑开，松手后再滑回整齐的格子里。
+        //
+        // 位置一律记「相对内容区左上角」的偏移，不是屏幕坐标 ——
+        // 否则一滚动整页都会跟着做归位动画。
+        let list_mode = self.config.view_mode == ViewMode::List;
+        let gap = ui.spacing().item_spacing.x;
         let sc = &ui.spacing().scroll;
         let bar = sc.bar_width + sc.bar_inner_margin + sc.bar_outer_margin;
         let avail = (ui.available_width() - bar).max(160.0);
-        const MIN_TILE: f32 = 240.0;
-        let cols = (((avail + spacing) / (MIN_TILE + spacing)).floor()).max(1.0);
-        let tile_w = ((avail - spacing * (cols - 1.0)) / cols).floor().max(160.0);
-        let cols = cols as usize;
+        let (cols, tile_w, tile_h) = if list_mode {
+            (1usize, avail, ROW_H)
+        } else {
+            let c = (((avail + gap) / (TILE_W_MIN + gap)).floor()).max(1.0);
+            (c as usize, ((avail - gap * (c - 1.0)) / c).floor().max(160.0), TILE_H)
+        };
+        let cell = egui::vec2(tile_w + gap, tile_h + gap);
+        let n = visible.len();
+        let rows = n.div_ceil(cols);
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_width(avail);
-            for chunk in visible.chunks(cols) {
-                ui.horizontal_top(|ui| {
-                    for (i, s) in chunk {
-                        let is_playing = playing.contains(&s.path);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(tile_w, TILE_H),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.set_max_width(tile_w);
-                                self.ui_sound_tile(ui, *i, s, is_playing, presets, tile_w, pending);
-                            },
-                        );
-                    }
-                });
+            let origin = ui.cursor().left_top();
+            // 先把整块地占掉，滚动条才知道内容有多高。
+            ui.allocate_exact_size(
+                egui::vec2(avail, rows as f32 * cell.y - gap.min(cell.y)),
+                egui::Sense::hover(),
+            );
+
+            let pointer = ui.ctx().pointer_interact_pos();
+            let mut drag = *self.drag.borrow();
+            // 被拖的那一项在当前可见列表里的槽位。搜索把它过滤掉了就当没在拖。
+            let from_slot = drag
+                .filter(|d| d.active)
+                .and_then(|d| visible.iter().position(|(i, _)| *i == d.from));
+            // 指针落在第几格 = 松手后会插到哪儿。
+            let drop_slot = match (from_slot, pointer) {
+                (Some(_), Some(pos)) => {
+                    let rel = pos - origin;
+                    let col = ((rel.x / cell.x).floor() as isize).clamp(0, cols as isize - 1) as usize;
+                    let row = (rel.y / cell.y).floor().max(0.0) as usize;
+                    Some((row * cols + col).min(n.saturating_sub(1)))
+                }
+                _ => None,
+            };
+
+            // 显示顺序：把被拖的那一项抽出来，插到目标槽位。其余项顺次让位。
+            let mut order: Vec<usize> = (0..n).collect();
+            if let (Some(f), Some(t)) = (from_slot, drop_slot) {
+                let it = order.remove(f);
+                order.insert(t.min(order.len()), it);
             }
+
+            // 目标空位：拖动时画一个虚位，明确告诉用户会落在哪。
+            if let Some(t) = drop_slot {
+                let r = egui::Rect::from_min_size(
+                    origin + egui::vec2((t % cols) as f32 * cell.x, (t / cols) as f32 * cell.y),
+                    egui::vec2(tile_w, tile_h),
+                );
+                ui.painter().rect_filled(
+                    r,
+                    egui::Rounding::same(theme::R_CARD),
+                    theme::p().accent_soft,
+                );
+            }
+
+            for (slot, &vi) in order.iter().enumerate() {
+                let (i, s) = visible[vi];
+                let dragged = drag.map(|d| d.active && d.from == i).unwrap_or(false);
+                let target = egui::vec2((slot % cols) as f32 * cell.x, (slot / cols) as f32 * cell.y);
+                // 被拖的那张跟着指针走，不做归位动画（否则会「追」着手指跑）。
+                let pos = if dragged {
+                    // 位置照样喂进动画表，松手时才不会从旧值弹一下。
+                    let p = pointer.map(|p| p - drag.map(|d| d.grab).unwrap_or_default())
+                        .unwrap_or(origin + target);
+                    let off = p - origin;
+                    ui.ctx().animate_value_with_time(tile_anim_id(&s.path, 0), off.x, 0.0);
+                    ui.ctx().animate_value_with_time(tile_anim_id(&s.path, 1), off.y, 0.0);
+                    p
+                } else {
+                    origin
+                        + egui::vec2(
+                            ui.ctx().animate_value_with_time(tile_anim_id(&s.path, 0), target.x, REFLOW_TIME),
+                            ui.ctx().animate_value_with_time(tile_anim_id(&s.path, 1), target.y, REFLOW_TIME),
+                        )
+                };
+                let rect = egui::Rect::from_min_size(pos, egui::vec2(tile_w, tile_h));
+
+                if dragged {
+                    // 拖起来的那张只画外观、不放控件：手指正压在上面，
+                    // 放真控件的话滑块会被顺手拖走。
+                    ghost_tile(ui, rect, s, list_mode);
+                    continue;
+                }
+
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                child.set_width(tile_w);
+                child.set_max_width(tile_w);
+                // 卡片底衬先 interact 再画内容：内容里的按钮/滑块画在后面、层级更高，
+                // 会优先吃掉点击，所以长按只会在「按在空白处」时触发。
+                let bg = child.interact(
+                    rect,
+                    egui::Id::new(("tile-bg", i)),
+                    egui::Sense::click_and_drag(),
+                );
+                self.ui_sound_tile(&mut child, i, s, playing.contains(&s.path), presets, tile_w, list_mode, pending);
+
+                let now = child.input(|inp| inp.time);
+                // 手柄：按下即拖，不用等长按。
+                if pending.grip_pressed.take() == Some(i) && drag.is_none() {
+                    if let Some(pos) = pointer {
+                        drag = Some(DragState {
+                            from: i,
+                            grab: pos - rect.min,
+                            active: true,
+                            press_at: now,
+                            press_pos: pos,
+                        });
+                    }
+                } else if bg.is_pointer_button_down_on() && drag.is_none() {
+                    if let Some(pos) = pointer {
+                        drag = Some(DragState {
+                            from: i,
+                            grab: pos - rect.min,
+                            active: false,
+                            press_at: now,
+                            press_pos: pos,
+                        });
+                    }
+                }
+            }
+
+            // ── 拖动状态机 ──
+            let down = ui.input(|inp| inp.pointer.any_down());
+            if let Some(d) = drag.as_mut() {
+                if !d.active {
+                    let moved = pointer.map(|p| (p - d.press_pos).length()).unwrap_or(0.0);
+                    if moved > LONG_PRESS_SLOP {
+                        // 按下后马上就滑动 = 在操作控件或滚页面，不是要拖卡片。
+                        // 这里只是让它**永远等不到**长按，不能直接清空 ——
+                        // 清空了下一帧按键还按着，会重新计时，滑到一半停手就诈尸变成拖动。
+                        d.press_at = f64::MAX;
+                    } else if ui.input(|inp| inp.time) - d.press_at >= LONG_PRESS && down {
+                        d.active = true;
+                    }
+                }
+            }
+            if let Some(d) = drag {
+                if d.active {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                    ui.ctx().request_repaint();
+                }
+                if !down {
+                    // 松手：落到目标槽位。
+                    if d.active {
+                        if let (Some(f), Some(t)) = (from_slot, drop_slot) {
+                            if f != t {
+                                pending.reorder = Some((d.from, visible[t].0));
+                            }
+                        }
+                    }
+                    drag = None;
+                }
+            }
+            *self.drag.borrow_mut() = drag;
         });
     }
 
@@ -800,10 +1023,11 @@ impl App {
         });
     }
 
-    /// 单个音效瓦片：拖动手柄 + 播放按钮 + 名字 + 快捷键徽章 + 音量。
+    /// 单个音效项。`compact` = 列表模式（一行放下所有东西）。
     ///
-    /// 尺寸完全由外面给的 `tile_w` / `TILE_H` 决定，内部所有控件的宽度都从它算出来，
+    /// 尺寸完全由外面给的 `tile_w` / 行高决定，内部所有控件的宽度都从它算出来，
     /// 绝不用 `available_width()` 反推 —— 否则内容一旦顶到边就会把格子撑大。
+    #[allow(clippy::too_many_arguments)]
     fn ui_sound_tile(
         &self,
         ui: &mut egui::Ui,
@@ -812,129 +1036,122 @@ impl App {
         is_playing: bool,
         presets: &[f32],
         tile_w: f32,
+        compact: bool,
+        pending: &mut Pending,
+    ) {
+        let inner_w = tile_w - 24.0;
+        theme::card(is_playing).show(ui, |ui| {
+            ui.set_width(inner_w);
+            ui.set_max_width(inner_w);
+            if compact {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(ROW_H - 22.0);
+                    drag_handle(ui, i, pending);
+                    self.tile_play_button(ui, i, s, is_playing, pending);
+                    // 名字占中间的弹性空间，快捷键 + 音量固定宽度靠右。
+                    let right = 250.0_f32.min(inner_w * 0.55);
+                    let name_w = (inner_w - right - 76.0).max(40.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(name_w, 22.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| self.tile_name(ui, s, is_playing),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.tile_volume(ui, i, s, presets, right * 0.55, pending);
+                        self.tile_hotkey(ui, i, s, pending);
+                    });
+                });
+            } else {
+                ui.vertical(|ui| {
+                    ui.set_min_height(TILE_H - 24.0);
+                    ui.horizontal(|ui| {
+                        drag_handle(ui, i, pending);
+                        self.tile_play_button(ui, i, s, is_playing, pending);
+                        self.tile_name(ui, s, is_playing);
+                    });
+                    ui.horizontal(|ui| self.tile_hotkey(ui, i, s, pending));
+                    ui.horizontal(|ui| self.tile_volume(ui, i, s, presets, inner_w, pending));
+                });
+            }
+        });
+    }
+
+    fn tile_play_button(
+        &self, ui: &mut egui::Ui, i: usize, _s: &Sound, _is_playing: bool, pending: &mut Pending,
+    ) {
+        if ui.add(egui::Button::new("▶").min_size(egui::vec2(28.0, 24.0))).clicked() {
+            pending.play.push(i);
+        }
+    }
+
+    fn tile_name(&self, ui: &mut egui::Ui, s: &Sound, is_playing: bool) {
+        let name = egui::RichText::new(&s.name).strong().color(if is_playing {
+            theme::p().accent
+        } else {
+            theme::p().text
+        });
+        ui.add(egui::Label::new(name).wrap_mode(egui::TextWrapMode::Truncate));
+    }
+
+    fn tile_hotkey(&self, ui: &mut egui::Ui, i: usize, s: &Sound, pending: &mut Pending) {
+        let texts = self.texts();
+        if self.capturing == Some(CaptureTarget::Sound(i)) {
+            ui.add(
+                egui::Button::new(
+                    egui::RichText::new(texts.capturing_cancel).size(12.0).color(theme::p().text),
+                )
+                .fill(theme::p().accent),
+            );
+        } else if let Some(h) = &s.hotkey {
+            let btn = egui::Button::new(
+                egui::RichText::new(hotkeys::pretty_combo(h)).size(12.0).color(theme::p().text),
+            )
+            .fill(theme::p().accent_soft);
+            if ui.add(btn).on_hover_text(texts.set_hotkey).clicked() {
+                pending.capture = Some(CaptureTarget::Sound(i));
+            }
+            if ui.small_button("✖").on_hover_text(texts.clear).clicked() {
+                pending.clear_hotkey.push(i);
+            }
+        } else {
+            let btn = egui::Button::new(
+                egui::RichText::new(format!("＋ {}", texts.set_hotkey_short))
+                    .size(12.0)
+                    .color(theme::p().dim),
+            )
+            .frame(false);
+            if ui.add(btn).clicked() {
+                pending.capture = Some(CaptureTarget::Sound(i));
+            }
+        }
+    }
+
+    fn tile_volume(
+        &self, ui: &mut egui::Ui, i: usize, s: &Sound, presets: &[f32], width: f32,
         pending: &mut Pending,
     ) {
         let texts = self.texts();
-        // 卡片内容的可用宽度 = 瓦片宽 - 左右内边距。
-        let inner_w = tile_w - 24.0;
-        let dragging_other = egui::DragAndDrop::has_payload_of_type::<DragSound>(ui.ctx());
-
-        let frame_resp = theme::card(is_playing).show(ui, |ui| {
-            ui.set_width(inner_w);
-            ui.set_max_width(inner_w);
-            ui.vertical(|ui| {
-                ui.set_min_height(TILE_H - 24.0);
-
-                // 第一行：拖动手柄 + 播放 + 名字（正在播时名字用强调色）
-                ui.horizontal(|ui| {
-                    drag_handle(ui, i);
-                    if ui
-                        .add(egui::Button::new("▶").min_size(egui::vec2(28.0, 24.0)))
-                        .clicked()
-                    {
-                        pending.play.push(i);
-                    }
-                    let name = egui::RichText::new(&s.name).strong().color(if is_playing {
-                        theme::p().accent
-                    } else {
-                        theme::p().text
-                    });
-                    ui.add(egui::Label::new(name).wrap_mode(egui::TextWrapMode::Truncate));
-                });
-
-                // 第二行：快捷键
-                ui.horizontal(|ui| {
-                    let capturing_this = self.capturing == Some(CaptureTarget::Sound(i));
-                    if capturing_this {
-                        ui.add(
-                            egui::Button::new(
-                                egui::RichText::new(texts.capturing_cancel)
-                                    .size(12.0)
-                                    .color(theme::p().text),
-                            )
-                            .fill(theme::p().accent),
-                        );
-                    } else if let Some(h) = &s.hotkey {
-                        let btn = egui::Button::new(
-                            egui::RichText::new(hotkeys::pretty_combo(h))
-                                .size(12.0)
-                                .color(theme::p().text),
-                        )
-                        .fill(theme::p().accent_soft);
-                        if ui.add(btn).on_hover_text(texts.set_hotkey).clicked() {
-                            pending.capture = Some(CaptureTarget::Sound(i));
-                        }
-                        if ui.small_button("✖").on_hover_text(texts.clear).clicked() {
-                            pending.clear_hotkey.push(i);
-                        }
-                    } else {
-                        let btn = egui::Button::new(
-                            egui::RichText::new(format!("＋ {}", texts.set_hotkey_short))
-                                .size(12.0)
-                                .color(theme::p().dim),
-                        )
-                        .frame(false);
-                        if ui.add(btn).clicked() {
-                            pending.capture = Some(CaptureTarget::Sound(i));
-                        }
-                    }
-                });
-
-                // 第三行：单独音量（可拖、可直接输入数值、可右键选档位）
-                ui.horizontal(|ui| {
-                    let mut v = s.volume;
-                    let mut changed: Option<f32> = None;
-                    let show_reset = (v - 1.0).abs() > f32::EPSILON;
-                    // 宽度从 tile_w 推，不看 available_width，撑不大格子
-                    let reset_w = if show_reset { 46.0 } else { 0.0 };
-                    ui.spacing_mut().slider_width = (inner_w - 62.0 - reset_w).clamp(40.0, inner_w);
-                    ui.push_id(("vol", i), |ui| {
-                        let resp = ui.add(
-                            egui::Slider::new(&mut v, 0.0..=2.0)
-                                .show_value(true)
-                                .fixed_decimals(2),
-                        );
-                        if resp.changed() {
-                            changed = Some(v);
-                        }
-                        // 右键这条滑块 -> 档位快选
-                        if let Some(pv) =
-                            volume_preset_menu(&resp, presets, texts.volume_preset_menu, 2.0)
-                        {
-                            changed = Some(pv);
-                        }
-                        if show_reset
-                            && ui
-                                .small_button(texts.reset)
-                                .on_hover_text(texts.reset_volume_tooltip)
-                                .clicked()
-                        {
-                            changed = Some(1.0);
-                        }
-                    });
-                    if let Some(nv) = changed {
-                        pending.set_volume.push((i, nv));
-                    }
-                });
-            });
+        let mut v = s.volume;
+        let mut changed: Option<f32> = None;
+        let show_reset = (v - 1.0).abs() > f32::EPSILON;
+        let reset_w = if show_reset { 46.0 } else { 0.0 };
+        ui.spacing_mut().slider_width = (width - 62.0 - reset_w).clamp(40.0, width.max(40.0));
+        ui.push_id(("vol", i), |ui| {
+            let resp = ui.add(egui::Slider::new(&mut v, 0.0..=2.0).show_value(true).fixed_decimals(2));
+            if resp.changed() {
+                changed = Some(v);
+            }
+            if let Some(pv) = volume_preset_menu(&resp, presets, texts.volume_preset_menu, 2.0) {
+                changed = Some(pv);
+            }
+            if show_reset
+                && ui.small_button(texts.reset).on_hover_text(texts.reset_volume_tooltip).clicked()
+            {
+                changed = Some(1.0);
+            }
         });
-
-        // 整张卡片当放置目标：拖着别的卡片经过时高亮，松手就换位置。
-        if dragging_other {
-            let rect = frame_resp.response.rect;
-            let resp = ui.interact(rect, egui::Id::new(("drop", i)), egui::Sense::hover());
-            if resp.dnd_hover_payload::<DragSound>().is_some() {
-                ui.painter().rect_stroke(
-                    rect,
-                    egui::Rounding::same(theme::R_CARD),
-                    egui::Stroke::new(2.0, theme::p().accent),
-                );
-            }
-            if let Some(from) = resp.dnd_release_payload::<DragSound>() {
-                if from.0 != i {
-                    pending.reorder = Some((from.0, i));
-                }
-            }
+        if let Some(nv) = changed {
+            pending.set_volume.push((i, nv));
         }
     }
 
@@ -1138,6 +1355,34 @@ impl App {
                         pending.clear_stop = true;
                     }
                 });
+                // 热键诊断：「后台不触发」这种问题在别人机器上很难复现，
+                // 把钩子的真实状态摆出来，用户截个图就能定位。
+                if let Some(hk) = &self.hotkeys {
+                    let installed = hk.hook_installed();
+                    let events = hk.event_count();
+                    let ok = installed && events > 0;
+                    labeled_row_tip(ui, texts.hook_diag, Some(texts.hook_diag_tip), |ui| {
+                        let color = if ok { theme::p().ok } else { theme::p().danger };
+                        let idle = hk
+                            .idle_ms()
+                            .map(|ms| format!("{:.1}s", ms as f32 / 1000.0))
+                            .unwrap_or_else(|| "-".into());
+                        ui.colored_label(
+                            color,
+                            format!(
+                                "hook={} events={events} idle={idle} reinstalls={}",
+                                if installed { "on" } else { "off" },
+                                hk.reinstalls(),
+                            ),
+                        );
+                    });
+                    if !ok {
+                        hint(ui, texts.hook_dead_hint, theme::p().warn);
+                    }
+                    if ui.small_button(texts.open_log).on_hover_text(texts.open_log_tip).clicked() {
+                        platform::open_folder(&crate::config::data_root());
+                    }
+                }
             });
 
             // ── 系统音频 ──
@@ -1149,6 +1394,16 @@ impl App {
                     self.config.save();
                 }
                 if self.config.loopback_enabled {
+                    labeled_row_tip(ui, texts.capture_device, Some(texts.capture_device_tip), |ui| {
+                        device_combo(
+                            ui,
+                            "cap",
+                            &mut self.config.capture_device,
+                            out_devices,
+                            texts.capture_default,
+                            &mut pending.rebuild_engine,
+                        );
+                    });
                     labeled_row(ui, texts.loopback_volume, |ui| {
                         if ui
                             .add(egui::Slider::new(&mut self.config.loopback_volume, 0.0..=2.0).fixed_decimals(2))
@@ -1160,11 +1415,17 @@ impl App {
                     });
                 }
                 hint(ui, texts.loopback_hint, theme::p().dim);
-                if self.config.loopback_enabled
-                    && self.config.monitor_device.is_some()
-                    && audio::loopback_monitor_conflicts(self.config.monitor_device.as_deref())
-                {
-                    hint(ui, texts.loopback_monitor_conflict, theme::p().warn);
+                if self.config.loopback_enabled {
+                    let cap = self.config.capture_device.as_deref();
+                    if audio::loopback_monitor_conflicts(self.config.monitor_device.as_deref(), cap) {
+                        hint(ui, texts.loopback_monitor_conflict, theme::p().warn);
+                    }
+                    if audio::same_output(cap, self.config.output_device.as_deref()) {
+                        hint(ui, texts.capture_is_output, theme::p().dim);
+                    }
+                    if pending.rebuild_engine {
+                        self.config.save();
+                    }
                 }
                 ui.add_space(8.0);
                 theme::section_title(ui, texts.app_audio_routing);
@@ -1291,23 +1552,70 @@ impl eframe::App for App {
 }
 
 /// 卡片左上角的拖动手柄。用 painter 画六个点，不依赖字体里有没有对应字形。
-/// 只有手柄是拖动源，卡片其余部分照常点击 —— 否则滑块会和拖动抢手势。
-fn drag_handle(ui: &mut egui::Ui, i: usize) {
-    let id = egui::Id::new(("drag", i));
-    ui.dnd_drag_source(id, DragSound(i), |ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 24.0), egui::Sense::hover());
-        let c = theme::p().dim;
-        let p = ui.painter();
-        for row in 0..3 {
-            for col in 0..2 {
-                let pos = egui::pos2(
-                    rect.center().x + (col as f32 - 0.5) * 5.0,
-                    rect.center().y + (row as f32 - 1.0) * 5.0,
-                );
-                p.circle_filled(pos, 1.4, c);
-            }
+///
+/// 按住手柄**立刻**进入拖动；卡片其余空白处则要长按 —— 那里叠着滑块和按钮，
+/// 一按就拖会把它们的手势抢走。
+fn drag_handle(ui: &mut egui::Ui, i: usize, pending: &mut Pending) {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(12.0, 24.0),
+        egui::Sense::click_and_drag(),
+    );
+    if resp.is_pointer_button_down_on() {
+        pending.grip_pressed = Some(i);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    let c = if resp.hovered() { theme::p().accent } else { theme::p().dim };
+    let p = ui.painter();
+    for row in 0..3 {
+        for col in 0..2 {
+            let pos = egui::pos2(
+                rect.center().x + (col as f32 - 0.5) * 5.0,
+                rect.center().y + (row as f32 - 1.0) * 5.0,
+            );
+            p.circle_filled(pos, 1.4, c);
         }
-    });
+    }
+}
+
+/// 每张卡片的动画位置存两个 id（x / y），按文件路径做键 ——
+/// 用下标做键的话，一换顺序动画就串到别人身上了。
+fn tile_anim_id(path: &std::path::Path, axis: u8) -> egui::Id {
+    egui::Id::new(("tile-pos", path, axis))
+}
+
+/// 拖起来的那张卡的「影子」。只画外观不放控件，抬高一点 + 描边，
+/// 让人一眼看出它正被拿在手上。
+fn ghost_tile(ui: &mut egui::Ui, rect: egui::Rect, s: &Sound, compact: bool) {
+    let pal = theme::p();
+    let painter = ui.painter();
+    let rounding = egui::Rounding::same(theme::R_CARD);
+    // 手绘阴影：往右下偏一点画一层暗色，比引擎的 shadow 更可控。
+    painter.rect_filled(
+        rect.translate(egui::vec2(0.0, 3.0)),
+        rounding,
+        egui::Color32::from_black_alpha(60),
+    );
+    painter.rect_filled(rect, rounding, pal.surface);
+    painter.rect_stroke(rect, rounding, egui::Stroke::new(1.5, pal.accent));
+    let text_pos = rect.min + egui::vec2(14.0, if compact { rect.height() * 0.5 - 8.0 } else { 12.0 });
+    painter.text(
+        text_pos,
+        egui::Align2::LEFT_TOP,
+        &s.name,
+        egui::FontId::proportional(14.0),
+        pal.text,
+    );
+    if let Some(h) = &s.hotkey {
+        painter.text(
+            text_pos + egui::vec2(0.0, 22.0),
+            egui::Align2::LEFT_TOP,
+            hotkeys::pretty_combo(h),
+            egui::FontId::proportional(12.0),
+            pal.dim,
+        );
+    }
 }
 
 /// 给一个音量滑块挂右键菜单，从预设档位里一键选。返回用户选中的值。

@@ -3,6 +3,7 @@
 //! 文件夹里的音频文件会被自动扫描进列表；每个音频的快捷键 / 单独音量
 //! 记在同目录的 `_bindings.json` 里（以文件名为键），移动/改名音频不丢绑定。
 
+use crate::config::SortMode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ pub struct Sound {
     pub hotkey: Option<String>,
     /// 单独音量倍率（默认 1.0）。
     pub volume: f32,
+    /// 文件修改时间（按时间排序用）。取不到时是 UNIX 纪元。
+    pub modified: std::time::SystemTime,
 }
 
 /// 持久化到 `_bindings.json` 的单条绑定信息。
@@ -114,6 +117,10 @@ impl Profile {
                             .unwrap_or(&file_name)
                             .to_string();
                         let b = bindings.get(&file_name);
+                        let modified = p
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::UNIX_EPOCH);
                         (
                             b.and_then(|b| b.order),
                             Sound {
@@ -121,6 +128,7 @@ impl Profile {
                                 path: p,
                                 hotkey: b.and_then(|b| b.hotkey.clone()),
                                 volume: b.map(|b| b.volume).unwrap_or(1.0),
+                                modified,
                             },
                         )
                     })
@@ -172,10 +180,28 @@ impl Profile {
         self.sounds.insert(to, s);
     }
 
-    /// 按名字重排（放弃手动顺序）。
-    pub fn sort_by_name(&mut self) {
-        self.sounds
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    /// 按指定方式重排。`Custom` 保持文件里存的手动顺序不动。
+    pub fn apply_sort(&mut self, mode: SortMode) {
+        match mode {
+            SortMode::Custom => {}
+            SortMode::NameAsc => self
+                .sounds
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            SortMode::NameDesc => self
+                .sounds
+                .sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase())),
+            // 时间相同的（同一批拷进来的文件很常见）再按名字兜底，顺序才稳定。
+            SortMode::TimeAsc => self.sounds.sort_by(|a, b| {
+                a.modified
+                    .cmp(&b.modified)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+            SortMode::TimeDesc => self.sounds.sort_by(|a, b| {
+                b.modified
+                    .cmp(&a.modified)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+        }
     }
 
     /// 当前文件夹里的音频文件名集合（用于「有没有新文件」的轻量比对）。

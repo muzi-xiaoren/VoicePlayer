@@ -24,6 +24,32 @@ pub enum ThemeMode {
     Light,
 }
 
+/// 音效列表的排序方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SortMode {
+    /// 按名称 A→Z。
+    #[default]
+    NameAsc,
+    /// 按名称 Z→A。
+    NameDesc,
+    /// 按修改时间，旧→新。
+    TimeAsc,
+    /// 按修改时间，新→旧。
+    TimeDesc,
+    /// 自定义：完全按 `_bindings.json` 里存的手动顺序。拖动过一次就自动变成它。
+    Custom,
+}
+
+/// 音效列表的展示形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ViewMode {
+    /// 卡片网格。
+    #[default]
+    Grid,
+    /// 单列列表，一行一个，信息更紧凑。
+    List,
+}
+
 /// 重复按同一个快捷键时的行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RepeatMode {
@@ -61,6 +87,10 @@ pub struct AppConfig {
     pub input_device: Option<String>,
     /// 可选的监听设备（你的耳机），让自己也能听到音效。None = 不监听。
     pub monitor_device: Option<String>,
+    /// 系统音频捕获抓哪个**播放设备**。None = 系统默认播放设备。
+    /// 把某个程序在 Windows「音量合成器」里单独指到别的设备（比如 CABLE Input）之后，
+    /// 它的声音就不在默认设备上了，必须在这里显式选那个设备才捕得到。
+    pub capture_device: Option<String>,
     /// 当前激活的 profile 名（= profiles 下的子文件夹名）。
     pub active_profile: Option<String>,
     /// 音效音量 0.0–1.5。
@@ -97,6 +127,10 @@ pub struct AppConfig {
     /// 整个窗口的不透明度 0.0–1.0。1.0 = 完全不透明；0.0 = 底完全透明，
     /// 只剩文字和控件浮在桌面上（它们始终不透明，所以窗口不会真的消失）。
     pub window_opacity: f32,
+    /// 音效列表排序方式。
+    pub sort_mode: SortMode,
+    /// 音效列表展示形态（网格 / 列表）。
+    pub view_mode: ViewMode,
     pub window_x: Option<f32>,
     pub window_y: Option<f32>,
     pub window_w: Option<f32>,
@@ -109,6 +143,7 @@ impl Default for AppConfig {
             output_device: None,
             input_device: None,
             monitor_device: None,
+            capture_device: None,
             active_profile: None,
             effect_volume: 1.0,
             mic_passthrough: true,
@@ -128,6 +163,8 @@ impl Default for AppConfig {
             bg_opacity: 0.35,
             volume_presets: vec![0.1, 0.5, 0.8, 1.0, 1.2, 1.5],
             window_opacity: 1.0,
+            sort_mode: SortMode::default(),
+            view_mode: ViewMode::default(),
             window_x: None,
             window_y: None,
             window_w: None,

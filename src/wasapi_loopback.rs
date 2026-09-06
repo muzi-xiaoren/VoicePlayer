@@ -35,15 +35,20 @@ impl LoopbackBuf {
 }
 
 /// 启动环回捕获线程。
+///
+/// `device` = 要捕获哪个**播放设备**的声音（按设备名匹配，和设置里的输出设备列表同一套名字）。
+/// None = 系统默认播放设备。把某个程序（比如网易云）单独指到 CABLE Input 之后，
+/// 它的声音就不在默认设备上了，这时候必须显式选 CABLE Input 才捕得到。
 #[cfg(windows)]
 pub fn start_loopback_thread(
     buf: Arc<LoopbackBuf>,
     stop: Arc<AtomicBool>,
+    device: Option<String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("wasapi-loopback".into())
         .spawn(move || {
-            if let Err(e) = run_loopback(&buf, &stop) {
+            if let Err(e) = run_loopback(&buf, &stop, device.as_deref()) {
                 log::error!("WASAPI loopback: {e}");
             }
         })
@@ -54,13 +59,16 @@ pub fn start_loopback_thread(
 pub fn start_loopback_thread(
     _buf: Arc<LoopbackBuf>,
     _stop: Arc<AtomicBool>,
+    _device: Option<String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new().spawn(|| {}).unwrap()
 }
 
 #[cfg(windows)]
-fn run_loopback(buf: &Arc<LoopbackBuf>, stop: &Arc<AtomicBool>) -> Result<(), String> {
-    unsafe { ffi::run_loopback(buf, stop) }
+fn run_loopback(
+    buf: &Arc<LoopbackBuf>, stop: &Arc<AtomicBool>, device: Option<&str>,
+) -> Result<(), String> {
+    unsafe { ffi::run_loopback(buf, stop, device) }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -100,6 +108,32 @@ mod ffi {
         d1: 0x00000003, d2: 0x0000, d3: 0x0010,
         d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
     };
+    /// PKEY_Device_FriendlyName 的 fmtid（pid = 14）。设备的显示名，
+    /// 和 cpal 列出来的输出设备名是同一个来源，所以能直接按名字对上。
+    const FMTID_DEVICE: Guid = Guid {
+        d1: 0xA45C254E, d2: 0xDF1C, d3: 0x4EFD,
+        d4: [0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0],
+    };
+
+    #[repr(C)]
+    struct PropertyKey {
+        fmtid: Guid,
+        pid: u32,
+    }
+    const PKEY_DEVICE_FRIENDLY_NAME: PropertyKey =
+        PropertyKey { fmtid: FMTID_DEVICE, pid: 14 };
+
+    /// PROPVARIANT。只用到 vt 和 8 字节偏移处的联合体（VT_LPWSTR 时是宽字符串指针）。
+    #[repr(C)]
+    struct PropVariant {
+        vt: u16,
+        _r1: u16,
+        _r2: u16,
+        _r3: u16,
+        val: *mut u16,
+        _pad: usize,
+    }
+    const VT_LPWSTR: u16 = 31;
 
     #[repr(C)]
     struct WaveFormatEx {
@@ -120,6 +154,7 @@ mod ffi {
         ) -> i32;
         fn CoTaskMemFree(ptr: *const c_void);
         fn CoUninitialize();
+        fn PropVariantClear(pvar: *mut PropVariant) -> i32;
     }
 
     // COM vtable structs — 字段顺序必须与 C 头文件一致。
@@ -128,13 +163,38 @@ mod ffi {
         _qi: unsafe extern "system" fn(),
         _ar: unsafe extern "system" fn(),
         _rl: unsafe extern "system" fn(),
-        _en: unsafe extern "system" fn(),
+        enum_endpoints: unsafe extern "system" fn(
+            *mut c_void, u32, u32, *mut *mut c_void,
+        ) -> i32,
         get_default: unsafe extern "system" fn(
             *mut c_void, u32, u32, *mut *mut c_void,
         ) -> i32,
         _gd: unsafe extern "system" fn(),
         _rg: unsafe extern "system" fn(),
         _ur: unsafe extern "system" fn(),
+    }
+
+    #[repr(C)]
+    struct CollectionVtbl {
+        _qi: unsafe extern "system" fn(),
+        _ar: unsafe extern "system" fn(),
+        _rl: unsafe extern "system" fn(),
+        get_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+        item: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
+    }
+
+    #[repr(C)]
+    struct PropStoreVtbl {
+        _qi: unsafe extern "system" fn(),
+        _ar: unsafe extern "system" fn(),
+        _rl: unsafe extern "system" fn(),
+        _gc: unsafe extern "system" fn(),
+        _ga: unsafe extern "system" fn(),
+        get_value: unsafe extern "system" fn(
+            *mut c_void, *const PropertyKey, *mut PropVariant,
+        ) -> i32,
+        _sv: unsafe extern "system" fn(),
+        _cm: unsafe extern "system" fn(),
     }
 
     #[repr(C)]
@@ -146,7 +206,9 @@ mod ffi {
             *mut c_void, *const Guid, u32,
             *const c_void, *mut *mut c_void,
         ) -> i32,
-        _ops: unsafe extern "system" fn(),
+        open_prop_store: unsafe extern "system" fn(
+            *mut c_void, u32, *mut *mut c_void,
+        ) -> i32,
         _gi: unsafe extern "system" fn(),
         _gs: unsafe extern "system" fn(),
     }
@@ -197,6 +259,8 @@ mod ffi {
     const COINIT_MULTITHREADED: u32 = 0;
     const E_RENDER: u32 = 0;
     const E_CONSOLE: u32 = 0;
+    const DEVICE_STATE_ACTIVE: u32 = 0x1;
+    const STGM_READ: u32 = 0;
     const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
     const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
@@ -273,8 +337,72 @@ mod ffi {
         }
     }
 
+    /// 读设备的显示名。失败返回 None。
+    unsafe fn friendly_name(device: *mut c_void) -> Option<String> {
+        let mut store: *mut c_void = std::ptr::null_mut();
+        if (vtbl::<DeviceVtbl>(device).open_prop_store)(device, STGM_READ, &mut store) < 0 {
+            return None;
+        }
+        let mut pv = PropVariant { vt: 0, _r1: 0, _r2: 0, _r3: 0, val: std::ptr::null_mut(), _pad: 0 };
+        let hr = (vtbl::<PropStoreVtbl>(store).get_value)(
+            store, &PKEY_DEVICE_FRIENDLY_NAME, &mut pv,
+        );
+        let name = if hr >= 0 && pv.vt == VT_LPWSTR && !pv.val.is_null() {
+            let mut len = 0usize;
+            while *pv.val.add(len) != 0 { len += 1; }
+            Some(String::from_utf16_lossy(std::slice::from_raw_parts(pv.val, len)))
+        } else {
+            None
+        };
+        PropVariantClear(&mut pv);
+        release(store);
+        name
+    }
+
+    /// 按名字打开一个播放设备用于环回捕获；`want` 为 None 或找不到时退回系统默认。
+    ///
+    /// 找不到时**故意退回默认而不是报错**：设备被拔掉/改名之后，
+    /// 至少还能捕到点东西，不会整条功能静默失效。
+    unsafe fn open_render_device(
+        enum_obj: *mut c_void, want: Option<&str>,
+    ) -> Result<*mut c_void, i32> {
+        if let Some(want) = want.map(str::trim).filter(|w| !w.is_empty()) {
+            let mut coll: *mut c_void = std::ptr::null_mut();
+            let hr = (vtbl::<EnumVtbl>(enum_obj).enum_endpoints)(
+                enum_obj, E_RENDER, DEVICE_STATE_ACTIVE, &mut coll,
+            );
+            if hr >= 0 && !coll.is_null() {
+                let mut count: u32 = 0;
+                if (vtbl::<CollectionVtbl>(coll).get_count)(coll, &mut count) >= 0 {
+                    for i in 0..count {
+                        let mut dev: *mut c_void = std::ptr::null_mut();
+                        if (vtbl::<CollectionVtbl>(coll).item)(coll, i, &mut dev) < 0 || dev.is_null() {
+                            continue;
+                        }
+                        // cpal 列出的名字可能被截断（老 Windows 上限 31 字符），两边互相包含就算命中。
+                        let hit = friendly_name(dev)
+                            .map(|n| n == want || n.starts_with(want) || want.starts_with(&n))
+                            .unwrap_or(false);
+                        if hit {
+                            release(coll);
+                            log::info!("环回捕获设备：{want}");
+                            return Ok(dev);
+                        }
+                        release(dev);
+                    }
+                }
+                release(coll);
+            }
+            log::warn!("找不到播放设备「{want}」，环回捕获退回系统默认设备");
+        }
+        let mut device: *mut c_void = std::ptr::null_mut();
+        let hr = (vtbl::<EnumVtbl>(enum_obj)
+            .get_default)(enum_obj, E_RENDER, E_CONSOLE, &mut device);
+        if hr < 0 { Err(hr) } else { Ok(device) }
+    }
+
     pub(super) unsafe fn run_loopback(
-        buf: &Arc<LoopbackBuf>, stop: &Arc<AtomicBool>,
+        buf: &Arc<LoopbackBuf>, stop: &Arc<AtomicBool>, want: Option<&str>,
     ) -> Result<(), String> {
         let hr = CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED);
         if hr < 0 { return Err(format!("CoInitializeEx 0x{hr:08X}")); }
@@ -286,10 +414,14 @@ mod ffi {
         );
         if hr < 0 { CoUninitialize(); return Err(format!("CoCreateInstance 0x{hr:08X}")); }
 
-        let mut device: *mut c_void = std::ptr::null_mut();
-        let hr = (vtbl::<EnumVtbl>(enum_obj)
-            .get_default)(enum_obj, E_RENDER, E_CONSOLE, &mut device);
-        if hr < 0 { release(enum_obj); CoUninitialize(); return Err(format!("GetDefault 0x{hr:08X}")); }
+        let device = match open_render_device(enum_obj, want) {
+            Ok(d) => d,
+            Err(hr) => {
+                release(enum_obj);
+                CoUninitialize();
+                return Err(format!("GetDefault 0x{hr:08X}"));
+            }
+        };
 
         let mut client: *mut c_void = std::ptr::null_mut();
         let hr = (vtbl::<DeviceVtbl>(device)
