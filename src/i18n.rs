@@ -159,7 +159,6 @@ pub struct Texts {
     pub loopback_monitor_conflict: &'static str,
 
     // 单个音效音量
-    pub reset_volume_tooltip: &'static str,
 
     // 新界面：导航 / 分组 / 状态栏
     pub tab_sounds: &'static str,
@@ -191,6 +190,7 @@ pub struct Texts {
     pub volume_presets: &'static str,
     pub volume_presets_hint: &'static str,
     pub volume_preset_menu: &'static str,
+    pub volume_slider_tip: &'static str,
     pub add: &'static str,
     pub sort_tip: &'static str,
     pub sort_name_asc: &'static str,
@@ -292,7 +292,6 @@ impl Texts {
             loopback_volume: "捕获音量",
             loopback_hint: "将正在播放的音频（音乐、视频等）混入虚拟麦克风（需安装 VB-CABLE）",
             loopback_monitor_conflict: "监听设备就是系统默认播放设备，系统声音你本来就直接听得到；再混一份进监听会形成回授啸叫，所以这里不重复送。想单独监听请把监听设备换成另一个设备。",
-            reset_volume_tooltip: "恢复默认音量 1.00",
             tab_sounds: "音效",
             tab_settings: "设置",
             search_placeholder: "搜索音效…",
@@ -318,6 +317,7 @@ impl Texts {
             volume_presets: "音量档位",
             volume_presets_hint: "右键任意音量滑块可以从这些档位里一键选择。拖动数字可改，✖ 删除，＋ 新增。",
             volume_preset_menu: "快速设置音量",
+            volume_slider_tip: "右键选档位或复位",
             add: "＋ 新增",
             sort_tip: "音效列表的排序方式。手动拖动过卡片后会自动切换到「自定义」。",
             sort_name_asc: "名称 A→Z",
@@ -401,7 +401,6 @@ impl Texts {
             loopback_volume: "Capture Volume",
             loopback_hint: "Mix currently playing audio (music, video, etc.) into the virtual microphone (requires VB-CABLE)",
             loopback_monitor_conflict: "The monitor device is your system's default playback device, so you already hear system audio directly. Mixing it back in would cause a feedback howl, so it is skipped. Pick a different monitor device to monitor it separately.",
-            reset_volume_tooltip: "Reset to default volume 1.00",
             tab_sounds: "Sounds",
             tab_settings: "Settings",
             search_placeholder: "Search sounds…",
@@ -427,6 +426,7 @@ impl Texts {
             volume_presets: "Volume presets",
             volume_presets_hint: "Right-click any volume slider to pick one of these. Drag a number to edit, ✖ removes, ＋ adds.",
             volume_preset_menu: "Set volume",
+            volume_slider_tip: "Right-click for presets or reset",
             add: "＋ Add",
             sort_tip: "How the sound list is ordered. Dragging a card switches this to Custom automatically.",
             sort_name_asc: "Name A→Z",

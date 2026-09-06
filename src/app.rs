@@ -8,12 +8,17 @@ use crate::profile::{self, Profile, Sound};
 use crate::theme;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-/// 网格模式下音效瓦片的固定高度。三行内容 + 卡片内边距，所有卡片一样高，排版才齐。
-const TILE_H: f32 = 108.0;
 /// 网格模式下瓦片的最小宽度，用它算一行能放几列。
 const TILE_W_MIN: f32 = 240.0;
-/// 列表模式下每行的高度。
-const ROW_H: f32 = 46.0;
+/// 卡片框自身吃掉的垂直空间 = `theme::card()` 的上下内边距（10 + 10）。
+/// 描边是画在边界上的、不占布局空间，横竖都一样溢出半像素，所以不算进来 ——
+/// 这样瓦片高就等于卡片实际占的高，纵横间距才严格相等。
+///
+/// 瓦片高度 = 内容高 + 它，**不能写死**：写死过一次（108），
+/// 而实际内容比估的高，卡片比格子还高，纵向间距被吃掉、字体一变就顶到下一行。
+const CARD_V: f32 = 20.0;
+/// 音量数值框的固定宽度。滑块轨道 = 可用宽 - 它 - 一个间距，正好填满、右对齐。
+const VALUE_W: f32 = 52.0;
 /// 长按多久（秒）开始拖动。太短会和点击/拖滑块打架，太长手感发黏。
 const LONG_PRESS: f64 = 0.32;
 /// 长按判定期间允许的手指抖动（像素）。超过就当成是在操作控件，不进入拖动。
@@ -101,6 +106,8 @@ pub struct App {
     theme_sig: Option<(bool, Option<[u8; 3]>, bool)>,
     /// 拖动排序状态。渲染走 `&self`，所以用 RefCell 装。
     drag: std::cell::RefCell<Option<DragState>>,
+    /// 上一帧量到的卡片真实高度 [网格, 列表]。0 = 还没量过，先用公式估。
+    card_h: std::cell::Cell<[f32; 2]>,
    last_scan: Instant,
    /// 进程启动时刻。用来判断「开了这么久还一个按键都没收到」= 钩子被挡了。
    started: Instant,
@@ -175,6 +182,7 @@ impl App {
             bg_tex_path: None,
             theme_sig: None,
             drag: std::cell::RefCell::new(None),
+            card_h: std::cell::Cell::new([0.0, 0.0]),
            last_scan: Instant::now(),
            started: Instant::now(),
            last_signature,
@@ -684,6 +692,7 @@ impl App {
                     &self.config.volume_presets.clone(),
                     texts.volume_preset_menu,
                     1.5,
+                    texts.reset,
                 );
                 if let Some(v) = picked {
                     self.config.effect_volume = v;
@@ -848,26 +857,49 @@ impl App {
         // 否则一滚动整页都会跟着做归位动画。
         let list_mode = self.config.view_mode == ViewMode::List;
         let gap = ui.spacing().item_spacing.x;
-        let sc = &ui.spacing().scroll;
-        let bar = sc.bar_width + sc.bar_inner_margin + sc.bar_outer_margin;
-        let avail = (ui.available_width() - bar).max(160.0);
-        let (cols, tile_w, tile_h) = if list_mode {
-            (1usize, avail, ROW_H)
-        } else {
-            let c = (((avail + gap) / (TILE_W_MIN + gap)).floor()).max(1.0);
-            (c as usize, ((avail - gap * (c - 1.0)) / c).floor().max(160.0), TILE_H)
-        };
-        let cell = egui::vec2(tile_w + gap, tile_h + gap);
         let n = visible.len();
-        let rows = n.div_ceil(cols);
+
+        // 瓦片高度按实际内容算：每行固定 row_h，行间 item_spacing.y，
+        // 再加卡片框自身的 CARD_V。列表一行、网格三行。
+        let row_h = row_height(ui);
+        let gap_y = ui.spacing().item_spacing.y;
+        let card_rows = if list_mode { 1.0 } else { 3.0 };
+        let content_h = row_h * card_rows + gap_y * (card_rows - 1.0);
+        // 有上一帧量到的真实高度就用它，第一帧才用公式估的值兜底。
+        let measured = self.card_h.get()[usize::from(list_mode)];
+        let tile_h = if measured > 0.0 { measured } else { content_h + CARD_V };
+
+        // 滚动条的宽度**只在真的会出现滚动条时**才扣。
+        // 以前无条件扣掉，没滚动条时右边就白空一条，卡片右缘比上面的搜索框短一截。
+        // egui 默认是悬浮滚动条（不占宽），所以不扣才是对的。
+        let sc = ui.spacing().scroll;
+        let bar = if sc.floating {
+            sc.floating_allocated_width.max(sc.bar_width + sc.bar_inner_margin)
+        } else {
+            sc.bar_width + sc.bar_inner_margin + sc.bar_outer_margin
+        };
+        let full = ui.available_width().max(160.0);
+        let avail_h = ui.available_height();
+        // 布局只依赖宽度：先按满宽算一次，超高才让出滚动条的位置再算一次。
+        // 宽度变窄只会让内容更高，不会反过来又不需要滚动条，所以不会来回抖。
+        let layout_for = |w: f32| -> (usize, f32, f32) {
+            let (cols, tile_w) = if list_mode {
+                (1usize, w)
+            } else {
+                let c = (((w + gap) / (TILE_W_MIN + gap)).floor()).max(1.0);
+                (c as usize, ((w - gap * (c - 1.0)) / c).floor().max(160.0))
+            };
+            let rows = n.div_ceil(cols);
+            (cols, tile_w, rows as f32 * (tile_h + gap) - gap)
+        };
+        let avail = if layout_for(full).2 > avail_h { (full - bar).max(160.0) } else { full };
+        let (cols, tile_w, content_total_h) = layout_for(avail);
+        let cell = egui::vec2(tile_w + gap, tile_h + gap);
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let origin = ui.cursor().left_top();
             // 先把整块地占掉，滚动条才知道内容有多高。
-            ui.allocate_exact_size(
-                egui::vec2(avail, rows as f32 * cell.y - gap.min(cell.y)),
-                egui::Sense::hover(),
-            );
+            ui.allocate_exact_size(egui::vec2(avail, content_total_h), egui::Sense::hover());
 
             let pointer = ui.ctx().pointer_interact_pos();
             let mut drag = *self.drag.borrow();
@@ -949,7 +981,10 @@ impl App {
                     egui::Id::new(("tile-bg", i)),
                     egui::Sense::click_and_drag(),
                 );
-                self.ui_sound_tile(&mut child, i, s, playing.contains(&s.path), presets, tile_w, list_mode, pending);
+                self.ui_sound_tile(
+                    &mut child, i, s, playing.contains(&s.path), presets, tile_w, content_h,
+                    list_mode, pending,
+                );
 
                 let now = child.input(|inp| inp.time);
                 // 手柄：按下即拖，不用等长按。
@@ -1025,8 +1060,9 @@ impl App {
 
     /// 单个音效项。`compact` = 列表模式（一行放下所有东西）。
     ///
-    /// 尺寸完全由外面给的 `tile_w` / 行高决定，内部所有控件的宽度都从它算出来，
-    /// 绝不用 `available_width()` 反推 —— 否则内容一旦顶到边就会把格子撑大。
+    /// 所有宽度都从外面给的 `tile_w` 精确分配、加起来正好等于卡片内宽，
+    /// 绝不用 `available_width()` 反推，也绝不让某个控件「有就占位、没有就不占」——
+    /// 那会让同一排卡片里的滑块长短不一、数值框对不上一条竖线。
     #[allow(clippy::too_many_arguments)]
     fn ui_sound_tile(
         &self,
@@ -1036,49 +1072,61 @@ impl App {
         is_playing: bool,
         presets: &[f32],
         tile_w: f32,
+        content_h: f32,
         compact: bool,
         pending: &mut Pending,
     ) {
         let inner_w = tile_w - 24.0;
-        theme::card(is_playing).show(ui, |ui| {
+        let g = ui.spacing().item_spacing.x;
+        let row_h = row_height(ui);
+        let card = theme::card(is_playing).show(ui, |ui| {
             ui.set_width(inner_w);
             ui.set_max_width(inner_w);
             if compact {
+                // 一行放下：手柄 12 + 播放 28 + 名字(弹性) + 快捷键 + 音量，
+                // 五块宽度加四个间距 = inner_w。
+                let vol_w = (inner_w * 0.28).clamp(110.0, 180.0);
+                let hk_w = (inner_w * 0.22).clamp(110.0, 150.0);
+                let name_w = (inner_w - 40.0 - 4.0 * g - vol_w - hk_w).max(40.0);
                 ui.horizontal(|ui| {
-                    ui.set_min_height(ROW_H - 22.0);
+                    ui.set_min_height(content_h);
                     drag_handle(ui, i, pending);
-                    self.tile_play_button(ui, i, s, is_playing, pending);
-                    // 名字占中间的弹性空间，快捷键 + 音量固定宽度靠右。
-                    let right = 250.0_f32.min(inner_w * 0.55);
-                    let name_w = (inner_w - right - 76.0).max(40.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(name_w, 22.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| self.tile_name(ui, s, is_playing),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.tile_volume(ui, i, s, presets, right * 0.55, pending);
-                        self.tile_hotkey(ui, i, s, pending);
+                    self.tile_play_button(ui, i, pending);
+                    sized_row(ui, name_w, row_h, |ui| self.tile_name(ui, s, is_playing));
+                    sized_row(ui, hk_w, row_h, |ui| self.tile_hotkey(ui, i, s, pending));
+                    sized_row(ui, vol_w, row_h, |ui| {
+                        self.tile_volume(ui, i, s, presets, vol_w, pending)
                     });
                 });
             } else {
+                // 三行都用固定高度块，不让某一行按自己的内容长高 ——
+                // 「按钮高 = 字高 + 内边距」和「滑块高 = interact_size」本来就不一样，
+                // 放任它们各长各的，卡片实际高度就和外面算的格子对不上。
                 ui.vertical(|ui| {
-                    ui.set_min_height(TILE_H - 24.0);
-                    ui.horizontal(|ui| {
+                    ui.set_min_height(content_h);
+                    sized_row(ui, inner_w, row_h, |ui| {
                         drag_handle(ui, i, pending);
-                        self.tile_play_button(ui, i, s, is_playing, pending);
+                        self.tile_play_button(ui, i, pending);
                         self.tile_name(ui, s, is_playing);
                     });
-                    ui.horizontal(|ui| self.tile_hotkey(ui, i, s, pending));
-                    ui.horizontal(|ui| self.tile_volume(ui, i, s, presets, inner_w, pending));
+                    sized_row(ui, inner_w, row_h, |ui| self.tile_hotkey(ui, i, s, pending));
+                    sized_row(ui, inner_w, row_h, |ui| {
+                        self.tile_volume(ui, i, s, presets, inner_w, pending)
+                    });
                 });
             }
         });
+        // 把卡片**真实**高度记下来给下一帧当格子高。
+        // 光靠公式算不准：egui 里按钮高 = 字高 + 内边距、滑块高 = interact_size，
+        // 各控件规则不同，还随字体和 DPI 变，算出来和实际差一点点，
+        // 卡片就会比格子高、纵向间距被吃掉。量一次比猜十次靠谱。
+        // 高度只取决于内容和样式，不受格子高影响，所以不会来回抖。
+        let mut m = self.card_h.get();
+        m[usize::from(compact)] = card.response.rect.height();
+        self.card_h.set(m);
     }
 
-    fn tile_play_button(
-        &self, ui: &mut egui::Ui, i: usize, _s: &Sound, _is_playing: bool, pending: &mut Pending,
-    ) {
+    fn tile_play_button(&self, ui: &mut egui::Ui, i: usize, pending: &mut Pending) {
         if ui.add(egui::Button::new("▶").min_size(egui::vec2(28.0, 24.0))).clicked() {
             pending.play.push(i);
         }
@@ -1093,20 +1141,24 @@ impl App {
         ui.add(egui::Label::new(name).wrap_mode(egui::TextWrapMode::Truncate));
     }
 
+    /// 快捷键小徽章。绑了是实心块，没绑是同尺寸的描边块 ——
+    /// 以前没绑的是一行浅灰无边框文字，一排里「蓝块、灰字、灰字」轻重不一，
+    /// 看着就像没排齐。
     fn tile_hotkey(&self, ui: &mut egui::Ui, i: usize, s: &Sound, pending: &mut Pending) {
         let texts = self.texts();
+        let pal = theme::p();
         if self.capturing == Some(CaptureTarget::Sound(i)) {
             ui.add(
                 egui::Button::new(
-                    egui::RichText::new(texts.capturing_cancel).size(12.0).color(theme::p().text),
+                    egui::RichText::new(texts.capturing_cancel).size(12.0).color(pal.text),
                 )
-                .fill(theme::p().accent),
+                .fill(pal.accent),
             );
         } else if let Some(h) = &s.hotkey {
             let btn = egui::Button::new(
-                egui::RichText::new(hotkeys::pretty_combo(h)).size(12.0).color(theme::p().text),
+                egui::RichText::new(hotkeys::pretty_combo(h)).size(12.0).color(pal.text),
             )
-            .fill(theme::p().accent_soft);
+            .fill(pal.accent_soft);
             if ui.add(btn).on_hover_text(texts.set_hotkey).clicked() {
                 pending.capture = Some(CaptureTarget::Sound(i));
             }
@@ -1115,39 +1167,45 @@ impl App {
             }
         } else {
             let btn = egui::Button::new(
-                egui::RichText::new(format!("＋ {}", texts.set_hotkey_short))
-                    .size(12.0)
-                    .color(theme::p().dim),
+                egui::RichText::new(format!("＋ {}", texts.set_hotkey_short)).size(12.0).color(pal.dim),
             )
-            .frame(false);
-            if ui.add(btn).clicked() {
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(1.0, pal.border));
+            if ui.add(btn).on_hover_text(texts.set_hotkey).clicked() {
                 pending.capture = Some(CaptureTarget::Sound(i));
             }
         }
     }
 
+    /// 音量：滑块 + 固定宽度的数值框，两者加一个间距正好等于 `width`。
+    ///
+    /// 没有「复位」按钮 —— 它以前只在音量 ≠ 1 时出现，一出现就把滑块压短 46px，
+    /// 同一排的滑块长短不一、数值框错开一大截。复位挪进右键菜单（本来就有档位菜单）。
     fn tile_volume(
         &self, ui: &mut egui::Ui, i: usize, s: &Sound, presets: &[f32], width: f32,
         pending: &mut Pending,
     ) {
         let texts = self.texts();
+        let g = ui.spacing().item_spacing.x;
         let mut v = s.volume;
         let mut changed: Option<f32> = None;
-        let show_reset = (v - 1.0).abs() > f32::EPSILON;
-        let reset_w = if show_reset { 46.0 } else { 0.0 };
-        ui.spacing_mut().slider_width = (width - 62.0 - reset_w).clamp(40.0, width.max(40.0));
         ui.push_id(("vol", i), |ui| {
-            let resp = ui.add(egui::Slider::new(&mut v, 0.0..=2.0).show_value(true).fixed_decimals(2));
-            if resp.changed() {
+            ui.spacing_mut().slider_width = (width - VALUE_W - g).max(40.0);
+            let sresp = ui
+                .add(egui::Slider::new(&mut v, 0.0..=2.0).show_value(false))
+                .on_hover_text(texts.volume_slider_tip);
+            let vresp = ui.add_sized(
+                egui::vec2(VALUE_W, row_height(ui)),
+                egui::DragValue::new(&mut v).speed(0.01).range(0.0..=2.0).fixed_decimals(2),
+            );
+            if sresp.changed() || vresp.changed() {
                 changed = Some(v);
             }
-            if let Some(pv) = volume_preset_menu(&resp, presets, texts.volume_preset_menu, 2.0) {
-                changed = Some(pv);
-            }
-            if show_reset
-                && ui.small_button(texts.reset).on_hover_text(texts.reset_volume_tooltip).clicked()
-            {
-                changed = Some(1.0);
+            // 滑块和数值框都能右键出档位菜单。
+            for r in [&sresp, &vresp] {
+                if let Some(pv) = volume_preset_menu(r, presets, texts.volume_preset_menu, 2.0, texts.reset) {
+                    changed = Some(pv);
+                }
             }
         });
         if let Some(nv) = changed {
@@ -1579,6 +1637,31 @@ fn drag_handle(ui: &mut egui::Ui, i: usize, pending: &mut Pending) {
     }
 }
 
+/// 卡片里一行的统一高度。
+///
+/// 取「最高的那种控件」：按钮 = 文字行高 + 上下内边距，滑块 / 数值框 = interact_size.y。
+/// 直接拿 interact_size.y 当行高会偏小 —— 正文 14px 的按钮比它高，
+/// 于是每张卡都悄悄比算出来的格子高一截，纵向间距被吃掉。
+fn row_height(ui: &egui::Ui) -> f32 {
+    let pad = ui.spacing().button_padding.y * 2.0;
+    let body = ui.text_style_height(&egui::TextStyle::Body);
+    let small = ui.fonts(|f| f.row_height(&egui::FontId::proportional(12.0)));
+    (body + pad).max(small + pad).max(ui.spacing().interact_size.y)
+}
+
+/// 在一行里占一块**固定宽高**的地方再放内容。
+/// 内容画多宽都不会影响后面控件的位置，一排卡片才能对齐成竖线。
+fn sized_row(ui: &mut egui::Ui, w: f32, h: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_max_width(w);
+            add(ui);
+        },
+    );
+}
+
 /// 每张卡片的动画位置存两个 id（x / y），按文件路径做键 ——
 /// 用下标做键的话，一换顺序动画就串到别人身上了。
 fn tile_anim_id(path: &std::path::Path, axis: u8) -> egui::Id {
@@ -1624,6 +1707,7 @@ fn volume_preset_menu(
     presets: &[f32],
     title: &str,
     max: f32,
+    reset_label: &str,
 ) -> Option<f32> {
     let mut picked = None;
     resp.context_menu(|ui| {
@@ -1633,6 +1717,12 @@ fn volume_preset_menu(
                 picked = Some(v);
                 ui.close_menu();
             }
+        }
+        ui.separator();
+        // 复位从卡片里挪到这儿：卡片上「有时有、有时没有」的按钮会把排版顶歪。
+        if ui.button(format!("{reset_label} 1.00")).clicked() {
+            picked = Some(1.0);
+            ui.close_menu();
         }
     });
     picked
