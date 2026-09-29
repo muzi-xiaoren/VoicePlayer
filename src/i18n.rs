@@ -218,6 +218,19 @@ pub struct Texts {
     pub stop_all_btn: &'static str,
     pub playing_now: &'static str,
     pub sound_count: &'static str,
+    pub scheme: &'static str,
+    pub scheme_tip: &'static str,
+    pub scheme_manage: &'static str,
+    pub scheme_new: &'static str,
+    pub scheme_save_as: &'static str,
+    pub scheme_rename: &'static str,
+    pub scheme_delete: &'static str,
+    pub scheme_delete_confirm: &'static str,
+    pub scheme_name_hint: &'static str,
+    pub scheme_name_taken: &'static str,
+    pub default_scheme: &'static str,
+    pub cancel: &'static str,
+    pub mic_is_cable: &'static str,
 }
 
 impl Texts {
@@ -345,6 +358,19 @@ impl Texts {
             stop_all_btn: "⏹ 停止全部",
             playing_now: "正在播放",
             sound_count: "个音效",
+            scheme: "方案",
+            scheme_tip: "同一批音效可以存好几套方案：每套有自己的快捷键、音量、顺序，\n以及设备、总音量、停止键、重复方式、麦克风转发这些设置。\n切换方案会整套换掉；在当前方案里改的东西会自动存进去。",
+            scheme_manage: "管理方案",
+            scheme_new: "新建空白方案…",
+            scheme_save_as: "另存为新方案…",
+            scheme_rename: "重命名…",
+            scheme_delete: "删除此方案",
+            scheme_delete_confirm: "删除方案「{}」？",
+            scheme_name_hint: "方案名",
+            scheme_name_taken: "名字为空或已存在",
+            default_scheme: "默认方案",
+            cancel: "取消",
+            mic_is_cable: "麦克风现在指向 CABLE Output（Windows 默认录音设备被切过去了？），它就是本程序输出的另一头，录下来再转发会回授，所以已跳过转发。这里请直接选你的真麦克风。",
         })
     }
 
@@ -454,6 +480,19 @@ impl Texts {
             stop_all_btn: "⏹ Stop all",
             playing_now: "Playing",
             sound_count: "sounds",
+            scheme: "Scheme",
+            scheme_tip: "The same sounds can have several schemes, each with its own hotkeys, volumes and order,\nplus devices, master volume, stop key, repeat behaviour and mic passthrough.\nSwitching swaps all of it; changes you make are saved into the current scheme automatically.",
+            scheme_manage: "Manage schemes",
+            scheme_new: "New empty scheme…",
+            scheme_save_as: "Save as new scheme…",
+            scheme_rename: "Rename…",
+            scheme_delete: "Delete this scheme",
+            scheme_delete_confirm: "Delete scheme \"{}\"?",
+            scheme_name_hint: "Scheme name",
+            scheme_name_taken: "Name is empty or already used",
+            default_scheme: "Default",
+            cancel: "Cancel",
+            mic_is_cable: "The microphone resolves to CABLE Output (did the Windows default recording device get switched?). That is the other end of this app's output, so forwarding it would feed back — passthrough is skipped. Pick your real microphone here.",
         })
     }
 }

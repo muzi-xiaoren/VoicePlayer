@@ -1,9 +1,13 @@
 //! Profile（配置组）= profiles 下的一个子文件夹。
 //!
-//! 文件夹里的音频文件会被自动扫描进列表；每个音频的快捷键 / 单独音量
-//! 记在同目录的 `_bindings.json` 里（以文件名为键），移动/改名音频不丢绑定。
+//! 文件夹里的音频文件会被自动扫描进列表；每个音频的快捷键 / 单独音量 / 顺序
+//! 记在同目录的 `_schemes.json` 里（以文件名为键），移动/改名音频不丢绑定。
+//!
+//! 同一批音频可以有好几套「方案」：每套方案有自己的键位、音量、顺序，
+//! 外加设备和播放设置（[`SchemeSettings`]），切一下就整套换掉。
+//! 老版本的 `_bindings.json` 第一次加载时会被当成一套方案迁移进来（原文件不动）。
 
-use crate::config::SortMode;
+use crate::config::{SchemeSettings, SortMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,12 +46,36 @@ fn default_volume() -> f32 {
     1.0
 }
 
+/// 一套方案。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Scheme {
+    /// 文件名 -> 绑定。
+    #[serde(default)]
+    bindings: BTreeMap<String, Binding>,
+    /// None = 从老的 `_bindings.json` 迁移过来、还没记过设置，由界面用当前设置补上。
+    #[serde(default)]
+    settings: Option<SchemeSettings>,
+}
+
+/// `_schemes.json` 的内容。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SchemeFile {
+    #[serde(default)]
+    active: String,
+    #[serde(default)]
+    schemes: BTreeMap<String, Scheme>,
+}
+
 /// 一个 profile。
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub name: String,
     pub dir: PathBuf,
     pub sounds: Vec<Sound>,
+    /// 当前方案名。
+    pub scheme: String,
+    /// 全部方案。**当前方案**的键位 / 音量 / 顺序以 `sounds` 为准，存盘时才写回这里。
+    schemes: BTreeMap<String, Scheme>,
 }
 
 fn is_audio(path: &Path) -> bool {
@@ -83,76 +111,104 @@ pub fn create_profile(name: &str) -> std::io::Result<()> {
 }
 
 impl Profile {
-    fn bindings_file(dir: &Path) -> PathBuf {
+    fn schemes_file(dir: &Path) -> PathBuf {
+        dir.join("_schemes.json")
+    }
+
+    /// 老版本只有一套绑定，存在这里。
+    fn legacy_bindings_file(dir: &Path) -> PathBuf {
         dir.join("_bindings.json")
     }
 
-    /// 扫描文件夹、合并 `_bindings.json`，加载出 profile。
-    /// `dir` 可以是 profiles 下的子文件夹，也可以是用户选的任意外部文件夹。
-    pub fn load(name: &str, dir: &Path) -> Self {
-        let dir = dir.to_path_buf();
-        let _ = std::fs::create_dir_all(&dir);
-
-        // 读已有绑定
-        let bindings: BTreeMap<String, Binding> = std::fs::read_to_string(Self::bindings_file(&dir))
+    /// 读 `_schemes.json`；没有就把老的 `_bindings.json` 迁成一套名为 `default_scheme` 的方案。
+    fn read_schemes(dir: &Path, default_scheme: &str) -> SchemeFile {
+        let mut file: SchemeFile = std::fs::read_to_string(Self::schemes_file(dir))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                let bindings = std::fs::read_to_string(Self::legacy_bindings_file(dir))
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                SchemeFile {
+                    active: default_scheme.to_string(),
+                    schemes: BTreeMap::from([(
+                        default_scheme.to_string(),
+                        Scheme { bindings, settings: None },
+                    )]),
+                }
+            });
+        if file.schemes.is_empty() {
+            file.schemes.insert(default_scheme.to_string(), Scheme::default());
+        }
+        if !file.schemes.contains_key(&file.active) {
+            file.active = file.schemes.keys().next().cloned().unwrap_or_default();
+        }
+        file
+    }
+
+    /// 扫描文件夹、合并当前方案的绑定，加载出 profile。
+    /// `dir` 可以是 profiles 下的子文件夹，也可以是用户选的任意外部文件夹。
+    pub fn load(name: &str, dir: &Path, default_scheme: &str) -> Self {
+        let dir = dir.to_path_buf();
+        let _ = std::fs::create_dir_all(&dir);
+        let file = Self::read_schemes(&dir, default_scheme);
 
         // 扫描音频文件
-        let mut ordered: Vec<(Option<u32>, Sound)> = std::fs::read_dir(&dir)
+        let mut sounds: Vec<Sound> = std::fs::read_dir(&dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.path())
                     .filter(|p| p.is_file() && is_audio(p))
                     .map(|p| {
-                        let file_name = p
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or_default()
-                            .to_string();
                         let name = p
                             .file_stem()
                             .and_then(|n| n.to_str())
-                            .unwrap_or(&file_name)
+                            .unwrap_or_default()
                             .to_string();
-                        let b = bindings.get(&file_name);
                         let modified = p
                             .metadata()
                             .and_then(|m| m.modified())
                             .unwrap_or(std::time::UNIX_EPOCH);
-                        (
-                            b.and_then(|b| b.order),
-                            Sound {
-                                name,
-                                path: p,
-                                hotkey: b.and_then(|b| b.hotkey.clone()),
-                                volume: b.map(|b| b.volume).unwrap_or(1.0),
-                                modified,
-                            },
-                        )
+                        Sound { name, path: p, hotkey: None, volume: 1.0, modified }
                     })
                     .collect()
             })
             .unwrap_or_default();
-        // 先按手动顺序，没排过的（新拖进来的）按名字接在最后。
-        ordered.sort_by(|(oa, a), (ob, b)| {
-            oa.unwrap_or(u32::MAX)
-                .cmp(&ob.unwrap_or(u32::MAX))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        let sounds: Vec<Sound> = ordered.into_iter().map(|(_, s)| s).collect();
+        if let Some(scheme) = file.schemes.get(&file.active) {
+            Self::apply_bindings(&mut sounds, &scheme.bindings);
+        }
 
         Profile {
             name: name.to_string(),
             dir,
             sounds,
+            scheme: file.active,
+            schemes: file.schemes,
         }
     }
 
-    /// 把当前绑定写回 `_bindings.json`。列表当前的先后顺序会作为 `order` 存下来，
-    /// 所以手动拖动排序是持久的。
-    pub fn save_bindings(&self) {
+    /// 把一套绑定套到音效列表上：键位、音量，以及按存下的手动顺序重排。
+    fn apply_bindings(sounds: &mut [Sound], bindings: &BTreeMap<String, Binding>) {
+        let file_name = |s: &Sound| {
+            s.path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string()
+        };
+        for s in sounds.iter_mut() {
+            let b = bindings.get(&file_name(s));
+            s.hotkey = b.and_then(|b| b.hotkey.clone());
+            s.volume = b.map(|b| b.volume).unwrap_or(1.0);
+        }
+        // 先按手动顺序，这套方案里没排过的（新拖进来的文件）按名字接在最后。
+        let order = |s: &Sound| bindings.get(&file_name(s)).and_then(|b| b.order).unwrap_or(u32::MAX);
+        sounds.sort_by(|a, b| {
+            order(a)
+                .cmp(&order(b))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
+
+    /// 把 `sounds` 里的键位 / 音量 / 当前先后顺序记回当前方案（不落盘）。
+    fn store_current(&mut self) {
         let mut map: BTreeMap<String, Binding> = BTreeMap::new();
         for (i, s) in self.sounds.iter().enumerate() {
             if let Some(fname) = s.path.file_name().and_then(|n| n.to_str()) {
@@ -166,9 +222,106 @@ impl Profile {
                 );
             }
         }
-        if let Ok(json) = serde_json::to_string_pretty(&map) {
-            let _ = std::fs::write(Self::bindings_file(&self.dir), json);
+        self.schemes.entry(self.scheme.clone()).or_default().bindings = map;
+    }
+
+    fn write(&self) {
+        let file = SchemeFile { active: self.scheme.clone(), schemes: self.schemes.clone() };
+        match serde_json::to_string_pretty(&file) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(Self::schemes_file(&self.dir), json) {
+                    log::error!("写 _schemes.json 失败：{e}");
+                }
+            }
+            Err(e) => log::error!("序列化方案失败：{e}"),
         }
+    }
+
+    /// 把当前绑定写回 `_schemes.json`。列表当前的先后顺序会作为 `order` 存下来，
+    /// 所以手动拖动排序是持久的。
+    pub fn save_bindings(&mut self) {
+        self.store_current();
+        self.write();
+    }
+
+    /// 全部方案名（按名字排好）。
+    pub fn scheme_names(&self) -> Vec<String> {
+        self.schemes.keys().cloned().collect()
+    }
+
+    /// 当前方案记下的设置。None = 还没记过（老数据迁移来的）。
+    pub fn settings(&self) -> Option<&SchemeSettings> {
+        self.schemes.get(&self.scheme).and_then(|s| s.settings.as_ref())
+    }
+
+    /// 把当前设置记进当前方案；和已存的一样就什么都不做（每帧都会调）。
+    pub fn sync_settings(&mut self, settings: SchemeSettings) {
+        if self.settings() == Some(&settings) {
+            return;
+        }
+        self.schemes.entry(self.scheme.clone()).or_default().settings = Some(settings);
+        self.save_bindings();
+    }
+
+    /// 切到另一套方案。名字不存在或就是当前方案时返回 false。
+    pub fn switch_scheme(&mut self, name: &str) -> bool {
+        if name == self.scheme || !self.schemes.contains_key(name) {
+            return false;
+        }
+        self.store_current();
+        self.scheme = name.to_string();
+        if let Some(scheme) = self.schemes.get(name) {
+            Self::apply_bindings(&mut self.sounds, &scheme.bindings);
+        }
+        self.write();
+        true
+    }
+
+    /// 新建一套方案并切过去。`copy` = 另存为（带上当前全部键位 / 音量 / 顺序）；
+    /// 否则是一套空白键位，设备和播放设置沿用当前的。名字为空或已存在时返回 false。
+    pub fn add_scheme(&mut self, name: &str, copy: bool) -> bool {
+        let name = name.trim();
+        if name.is_empty() || self.schemes.contains_key(name) {
+            return false;
+        }
+        self.store_current();
+        let cur = self.schemes.get(&self.scheme).cloned().unwrap_or_default();
+        let new = if copy {
+            cur
+        } else {
+            Scheme { bindings: BTreeMap::new(), settings: cur.settings }
+        };
+        self.schemes.insert(name.to_string(), new);
+        self.switch_scheme(name)
+    }
+
+    /// 重命名当前方案。名字为空或和别的方案重名时返回 false。
+    pub fn rename_scheme(&mut self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() || self.schemes.contains_key(name) {
+            return false;
+        }
+        self.store_current();
+        if let Some(s) = self.schemes.remove(&self.scheme) {
+            self.schemes.insert(name.to_string(), s);
+        }
+        self.scheme = name.to_string();
+        self.write();
+        true
+    }
+
+    /// 删掉当前方案并切到剩下的第一套。只剩一套时不让删，返回 false。
+    pub fn delete_scheme(&mut self) -> bool {
+        if self.schemes.len() <= 1 {
+            return false;
+        }
+        self.schemes.remove(&self.scheme);
+        self.scheme = self.schemes.keys().next().cloned().unwrap_or_default();
+        if let Some(scheme) = self.schemes.get(&self.scheme) {
+            Self::apply_bindings(&mut self.sounds, &scheme.bindings);
+        }
+        self.write();
+        true
     }
 
     /// 把第 `from` 项移动到第 `to` 项的位置（拖动排序用）。

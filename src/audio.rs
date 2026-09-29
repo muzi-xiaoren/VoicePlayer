@@ -81,6 +81,30 @@ pub fn loopback_monitor_conflicts(monitor_device: Option<&str>, capture_device: 
     monitor_device.is_some() && same_output(monitor_device, capture_device)
 }
 
+/// 系统默认录音设备名。
+pub fn default_input_name() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|d| d.name().ok())
+}
+
+/// 麦克风设置是不是正好是主输出那条虚拟线的另一头（CABLE Input ↔ CABLE Output）。
+///
+/// 典型场景：用户把 Windows 默认录音设备切成了 CABLE Output（好让游戏选「默认」），
+/// 而本程序的麦克风还是「系统默认」—— 于是它录的是自己的输出，转发回去就是回授啸叫。
+/// None 都按系统默认解析。
+pub fn mic_loops_into_output(input: Option<&str>, output: Option<&str>) -> bool {
+    let pick = |x: Option<&str>, def: fn() -> Option<String>| match x {
+        Some(n) if !n.trim().is_empty() => Some(n.to_string()),
+        _ => def(),
+    };
+    match (pick(input, default_input_name), pick(output, default_output_name)) {
+        // VB-CABLE 的两头只差 Input / Output 一个词（CABLE-A、CABLE-B 这些扩展线也一样）。
+        (Some(i), Some(o)) => i.contains("CABLE") && i.replacen("Output", "Input", 1) == o,
+        _ => false,
+    }
+}
+
 /// 猜一个默认应该选的输出设备名：优先 VB-CABLE 的 CABLE Input。
 pub fn guess_cable_output() -> Option<String> {
     output_devices().into_iter().find(|n| n.contains("CABLE Input"))
@@ -354,11 +378,16 @@ impl AudioEngine {
 
         // —— 麦克风采集 + 转发 ——
         let mic_enabled = Arc::new(AtomicBool::new(cfg.mic_passthrough));
-        let mic_stream = match Self::start_mic(cfg.input_device.as_deref(), &out_handle, mic_enabled.clone()) {
-            Ok(stream) => Some(stream),
-            Err(e) => {
-                log::warn!("麦克风转发未启动：{e}");
-                None
+        let mic_stream = if mic_loops_into_output(cfg.input_device.as_deref(), cfg.output_device.as_deref()) {
+            log::warn!("麦克风就是主输出那条虚拟线的另一头（CABLE Output），跳过转发，否则会回授");
+            None
+        } else {
+            match Self::start_mic(cfg.input_device.as_deref(), &out_handle, mic_enabled.clone()) {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    log::warn!("麦克风转发未启动：{e}");
+                    None
+                }
             }
         };
         // --- loopback (WASAPI system audio capture) ---

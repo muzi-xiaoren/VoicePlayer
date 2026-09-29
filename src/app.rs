@@ -1,6 +1,6 @@
 //! egui 界面 + 状态管理，把配置、音频线程、热键、profile、i18n 串起来。
 use crate::audio::{self, AudioCmd, AudioCtl};
-use crate::config::{AppConfig, RepeatMode, SortMode, ThemeMode, ViewMode};
+use crate::config::{AppConfig, RepeatMode, SchemeSettings, SortMode, ThemeMode, ViewMode};
 use crate::hotkeys::{self, HkAction, Hotkeys};
 use crate::i18n;
 use crate::platform;
@@ -56,12 +56,33 @@ enum CaptureTarget {
     Sound(usize),
     Stop,
 }
+/// 对当前 profile 的方案做什么。
+enum SchemeOp {
+    Switch(String),
+    /// 新建一套空白键位的方案（设备和播放设置沿用当前）。
+    New(String),
+    /// 把当前方案整套复制成一个新名字。
+    SaveAs(String),
+    Rename(String),
+    Delete,
+}
+
+/// 方案操作那一行正在做什么（要输名字 / 要确认删除）。
+#[derive(Clone, Copy, PartialEq)]
+enum SchemeEdit {
+    New,
+    SaveAs,
+    Rename,
+    Delete,
+}
+
 /// UI 一帧里收集下来、帧末统一处理的动作。
 #[derive(Default)]
 struct Pending {
     rebuild_engine: bool,
     switch_profile: Option<String>,
     new_profile: Option<String>,
+    scheme: Option<SchemeOp>,
     pick_folder: bool,
     remove_external: Option<String>,
     play: Vec<usize>,
@@ -96,6 +117,8 @@ pub struct App {
     new_profile_name: String,
     /// 「新建配置」输入框是否展开。
     show_new_profile: bool,
+    /// 方案操作行：(在做什么, 输入的名字, 上次提交是否因重名 / 空名被拒)。None = 收起。
+    scheme_edit: Option<(SchemeEdit, String, bool)>,
     /// 音效搜索关键字。
     search: String,
     page: Page,
@@ -140,13 +163,16 @@ impl App {
             .filter(|n| profiles.contains(n))
             .or_else(|| profiles.first().cloned());
         config.active_profile = active.clone();
-        let profile = active
-            .as_deref()
-            .map(|n| {
-                let mut p = Profile::load(n, &Self::dir_for_config(&config, n));
-                p.apply_sort(config.sort_mode);
-                p
-            });
+        let profile = active.as_deref().map(|n| {
+            let dir = Self::dir_for_config(&config, n);
+            let mut p = Profile::load(n, &dir, texts.default_scheme);
+            // 方案记着设备和播放设置，要在音频引擎起来之前换上。
+            if let Some(s) = p.settings() {
+                s.apply_to(&mut config);
+            }
+            p.apply_sort(config.sort_mode);
+            p
+        });
         let last_signature = profile
             .as_ref()
             .map(|p| Profile::file_signature(&p.dir))
@@ -176,6 +202,7 @@ impl App {
             capturing: None,
             new_profile_name: String::new(),
             show_new_profile: false,
+            scheme_edit: None,
             search: String::new(),
             page: Page::Sounds,
             bg_tex: None,
@@ -240,11 +267,25 @@ impl App {
     fn switch_profile(&mut self, name: &str) {
         self.config.active_profile = Some(name.to_string());
         let dir = self.dir_for(name);
-        let mut p = Profile::load(name, &dir);
-        p.apply_sort(self.config.sort_mode);
+        let p = Profile::load(name, &dir, self.texts().default_scheme);
         self.last_signature = Profile::file_signature(&p.dir);
         self.profile = Some(p);
         self.config.save();
+        self.adopt_scheme();
+    }
+    /// 换了 profile 或方案之后调用：把这套方案记下的设置换上来，
+    /// 并让列表顺序、音频引擎、热键都跟上。
+    fn adopt_scheme(&mut self) {
+        let saved = self.profile.as_ref().and_then(|p| p.settings().cloned());
+        if let Some(s) = saved.filter(|s| *s != SchemeSettings::from_config(&self.config)) {
+            s.apply_to(&mut self.config);
+            self.config.save();
+            self.rebuild_engine();
+        }
+        let mode = self.config.sort_mode;
+        if let Some(p) = self.profile.as_mut() {
+            p.apply_sort(mode);
+        }
         self.reregister_hotkeys();
     }
     fn add_external_folder(&mut self, dir: PathBuf, _dialog_title: &str) {
@@ -319,7 +360,7 @@ impl App {
             let sig = Profile::file_signature(&dir);
             if sig != self.last_signature {
                 self.last_signature = sig;
-                let mut p = Profile::load(&name, &dir);
+                let mut p = Profile::load(&name, &dir, self.texts().default_scheme);
                 p.apply_sort(self.config.sort_mode);
                 self.profile = Some(p);
                 self.reregister_hotkeys();
@@ -361,31 +402,11 @@ impl App {
             self.reregister_hotkeys();
         }
     }
-    /// 当窗口有焦点时，用 egui 自己的键盘事件来捕获快捷键（比钩子通道更可靠）。
+    /// 当窗口有焦点时，用 egui 自己的键盘 / 鼠标事件来捕获快捷键（比钩子通道更可靠）。
     fn poll_egui_capture(&self, ctx: &egui::Context) -> Option<Option<(u8, u32)>> {
-        let mut captured = None;
-        ctx.input(|input| {
-            for event in &input.events {
-                if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event {
-                    if *key == egui::Key::Escape {
-                        captured = Some(None);
-                        return;
-                    }
-                   if let Some(vk) = egui_key_to_vk(*key) {
-                        let vk = disambiguate_numpad(vk);
-                        let mut mods = 0u8;
-                        if modifiers.ctrl { mods |= hotkeys::MOD_CTRL; }
-                        if modifiers.alt { mods |= hotkeys::MOD_ALT; }
-                       if modifiers.shift { mods |= hotkeys::MOD_SHIFT; }
-                       captured = Some(Some((mods, vk)));
-                       return;
-                   }
-                }
-            }
-       });
-       captured
-   }
-    /// 窗口有焦点时用 egui 键盘事件触发快捷键。
+        egui_pressed(ctx).into_iter().next()
+    }
+    /// 窗口有焦点时用 egui 键盘 / 鼠标事件触发快捷键。
     ///
     /// 这条路**永远开着**，它是钩子的保险丝：钩子被系统悄悄摘掉时，
     /// 至少前台还能用。重复触发由 `Hotkeys` 内部按来源去重挡掉
@@ -396,20 +417,9 @@ impl App {
             return;
         }
         let Some(hk) = self.hotkeys.as_ref() else { return };
-        ctx.input(|input| {
-            for event in &input.events {
-                if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event {
-                    if let Some(vk) = egui_key_to_vk(*key) {
-                        let vk = disambiguate_numpad(vk);
-                        let mut mods = 0u8;
-                        if modifiers.ctrl { mods |= hotkeys::MOD_CTRL; }
-                        if modifiers.alt { mods |= hotkeys::MOD_ALT; }
-                        if modifiers.shift { mods |= hotkeys::MOD_SHIFT; }
-                        hk.trigger_from_vk(mods, vk);
-                    }
-                }
-            }
-        });
+        for (mods, vk) in egui_pressed(ctx).into_iter().flatten() {
+            hk.trigger_from_vk(mods, vk);
+        }
     }
     fn apply(&mut self, pending: Pending) {
        let texts = self.texts();
@@ -562,6 +572,25 @@ impl App {
         }
         if let Some(name) = pending.switch_profile {
             self.switch_profile(&name);
+        }
+        if let Some(op) = pending.scheme {
+            let renamed = matches!(op, SchemeOp::Rename(_));
+            let ok = self.profile.as_mut().is_some_and(|p| match &op {
+                SchemeOp::Switch(n) => p.switch_scheme(n),
+                SchemeOp::New(n) => p.add_scheme(n, false),
+                SchemeOp::SaveAs(n) => p.add_scheme(n, true),
+                SchemeOp::Rename(n) => p.rename_scheme(n),
+                SchemeOp::Delete => p.delete_scheme(),
+            });
+            if ok {
+                self.scheme_edit = None;
+                // 改名不换内容，不用重新套设置
+                if !renamed {
+                    self.adopt_scheme();
+                }
+            } else if let Some(e) = self.scheme_edit.as_mut() {
+                e.2 = true;
+            }
         }
         if pending.rebuild_engine {
             self.rebuild_engine();
@@ -820,12 +849,16 @@ impl App {
                 }
             });
         }
-        // ── 搜索：独占一行 ──
-        ui.add(
-            egui::TextEdit::singleline(&mut self.search)
-                .desired_width(ui.available_width())
-                .hint_text(format!("🔍 {}", texts.search_placeholder)),
-        );
+        // ── 方案 + 搜索 ──
+        ui.horizontal(|ui| {
+            self.ui_scheme_picker(ui, pending);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .desired_width(ui.available_width())
+                    .hint_text(format!("🔍 {}", texts.search_placeholder)),
+            );
+        });
+        self.ui_scheme_edit(ui, pending);
 
         ui.add_space(4.0);
 
@@ -1048,6 +1081,93 @@ impl App {
     }
 
     /// 居中的空状态提示。
+    /// 方案下拉 + 管理菜单。
+    fn ui_scheme_picker(&mut self, ui: &mut egui::Ui, pending: &mut Pending) {
+        let texts = self.texts();
+        let Some(p) = self.profile.as_ref() else { return };
+        let names = p.scheme_names();
+        let cur = p.scheme.clone();
+        ui.label(egui::RichText::new(texts.scheme).size(12.0).color(theme::p().dim))
+            .on_hover_text(texts.scheme_tip);
+        egui::ComboBox::from_id_salt("scheme")
+            .width(120.0)
+            .selected_text(cur.as_str())
+            .show_ui(ui, |ui| {
+                for n in &names {
+                    if ui.selectable_label(*n == cur, n).clicked() && *n != cur {
+                        pending.scheme = Some(SchemeOp::Switch(n.clone()));
+                    }
+                }
+            })
+            .response
+            .on_hover_text(texts.scheme_tip);
+        ui.menu_button("⋯", |ui| {
+            let mut picked = None;
+            if ui.button(texts.scheme_new).clicked() {
+                picked = Some((SchemeEdit::New, String::new()));
+            }
+            if ui.button(texts.scheme_save_as).clicked() {
+                picked = Some((SchemeEdit::SaveAs, String::new()));
+            }
+            if ui.button(texts.scheme_rename).clicked() {
+                picked = Some((SchemeEdit::Rename, cur.clone()));
+            }
+            if ui.add_enabled(names.len() > 1, egui::Button::new(texts.scheme_delete)).clicked() {
+                picked = Some((SchemeEdit::Delete, String::new()));
+            }
+            if let Some((kind, name)) = picked {
+                self.scheme_edit = Some((kind, name, false));
+                ui.close_menu();
+            }
+        })
+        .response
+        .on_hover_text(texts.scheme_manage);
+    }
+
+    /// 方案操作行：输名字（新建 / 另存为 / 重命名），或确认删除。平时收起。
+    fn ui_scheme_edit(&mut self, ui: &mut egui::Ui, pending: &mut Pending) {
+        let texts = self.texts();
+        let cur = self.profile.as_ref().map(|p| p.scheme.clone()).unwrap_or_default();
+        let Some((kind, name, rejected)) = self.scheme_edit.as_mut() else { return };
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            let submit = if *kind == SchemeEdit::Delete {
+                ui.label(texts.scheme_delete_confirm.replace("{}", &cur));
+                false
+            } else {
+                let title = match kind {
+                    SchemeEdit::New => texts.scheme_new,
+                    SchemeEdit::SaveAs => texts.scheme_save_as,
+                    _ => texts.scheme_rename,
+                };
+                ui.label(egui::RichText::new(title.trim_end_matches('…')).size(12.0).color(theme::p().dim));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(name)
+                        .desired_width((ui.available_width() - 150.0).max(80.0))
+                        .hint_text(texts.scheme_name_hint),
+                );
+                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            };
+            if ui.button(texts.confirm).clicked() || submit {
+                pending.scheme = Some(match kind {
+                    SchemeEdit::New => SchemeOp::New(name.clone()),
+                    SchemeEdit::SaveAs => SchemeOp::SaveAs(name.clone()),
+                    SchemeEdit::Rename => SchemeOp::Rename(name.clone()),
+                    SchemeEdit::Delete => SchemeOp::Delete,
+                });
+            }
+            if ui.button(texts.cancel).clicked() {
+                cancel = true;
+            }
+        });
+        if *rejected {
+            hint(ui, texts.scheme_name_taken, theme::p().warn);
+        }
+        if cancel {
+            self.scheme_edit = None;
+        }
+    }
+
     fn ui_empty_hint(&self, ui: &mut egui::Ui, text: &str) {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
@@ -1322,6 +1442,12 @@ impl App {
                 labeled_row(ui, texts.microphone, |ui| {
                     device_combo(ui, "in", &mut self.config.input_device, in_devices, texts.system_default, &mut pending.rebuild_engine);
                 });
+                if audio::mic_loops_into_output(
+                    self.config.input_device.as_deref(),
+                    self.config.output_device.as_deref(),
+                ) {
+                    hint(ui, texts.mic_is_cable, theme::p().warn);
+                }
                 labeled_row_tip(ui, texts.monitor_device, Some(texts.monitor_device_tip), |ui| {
                     device_combo(ui, "mon", &mut self.config.monitor_device, out_devices, texts.no_monitor, &mut pending.rebuild_engine);
                 });
@@ -1428,8 +1554,9 @@ impl App {
                         ui.colored_label(
                             color,
                             format!(
-                                "hook={} events={events} idle={idle} reinstalls={}",
+                                "hook={} mouse={} events={events} idle={idle} reinstalls={}",
                                 if installed { "on" } else { "off" },
+                                if hk.mouse_installed() { "on" } else { "off" },
                                 hk.reinstalls(),
                             ),
                         );
@@ -1578,6 +1705,11 @@ impl eframe::App for App {
             });
 
         self.apply(pending);
+        // 设置散落在很多地方改，不逐个去挂钩子：每帧对一次，变了就存进当前方案。
+        let now = SchemeSettings::from_config(&self.config);
+        if let Some(p) = self.profile.as_mut() {
+            p.sync_settings(now);
+        }
 
         // 每 ~2 秒记一次窗口几何，下次启动恢复。
         // 注意：ctx.screen_rect() 的原点恒为 (0,0)，拿不到窗口在屏幕上的位置，
@@ -1788,7 +1920,46 @@ fn hint(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     );
 }
 
+/// 这一帧 egui 收到的「按下」事件，翻成 (修饰键, VK code)。Esc 翻成 None（捕获时表示取消）。
+/// 键盘和鼠标中键 / 侧键都在这里；左右键不算，它们要留给界面操作。
+fn egui_pressed(ctx: &egui::Context) -> Vec<Option<(u8, u32)>> {
+    let mods_of = |m: &egui::Modifiers| {
+        let mut mods = 0u8;
+        if m.ctrl { mods |= hotkeys::MOD_CTRL; }
+        if m.alt { mods |= hotkeys::MOD_ALT; }
+        if m.shift { mods |= hotkeys::MOD_SHIFT; }
+        mods
+    };
+    let mut out = Vec::new();
+    ctx.input(|input| {
+        for event in &input.events {
+            match event {
+                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
+                    if *key == egui::Key::Escape {
+                        out.push(None);
+                    } else if let Some(vk) = egui_key_to_vk(*key) {
+                        out.push(Some((mods_of(modifiers), disambiguate_numpad(vk))));
+                    }
+                }
+                egui::Event::PointerButton { button, pressed: true, modifiers, .. } => {
+                    let vk = match button {
+                        egui::PointerButton::Middle => hotkeys::VK_MBUTTON,
+                        egui::PointerButton::Extra1 => hotkeys::VK_XBUTTON1,
+                        egui::PointerButton::Extra2 => hotkeys::VK_XBUTTON2,
+                        _ => continue,
+                    };
+                    out.push(Some((mods_of(modifiers), vk)));
+                }
+                _ => {}
+            }
+        }
+    });
+    out
+}
 /// 把 egui 的 Key 枚举映射成 Windows 虚拟键码（VK code），无法映射的返回 None。
+///
+/// egui 的符号键是按**字符**报的（Shift+/ 报成 Questionmark），
+/// 而 VK code 是按**物理键**算的，所以同一个键的两种字符映射到同一个 VK。
 fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
     use egui::Key;
     Some(match key {
@@ -1806,6 +1977,9 @@ fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
         Key::F1 => 0x70, Key::F2 => 0x71, Key::F3 => 0x72, Key::F4 => 0x73,
         Key::F5 => 0x74, Key::F6 => 0x75, Key::F7 => 0x76, Key::F8 => 0x77,
         Key::F9 => 0x78, Key::F10 => 0x79, Key::F11 => 0x7A, Key::F12 => 0x7B,
+        Key::F13 => 0x7C, Key::F14 => 0x7D, Key::F15 => 0x7E, Key::F16 => 0x7F,
+        Key::F17 => 0x80, Key::F18 => 0x81, Key::F19 => 0x82, Key::F20 => 0x83,
+        Key::F21 => 0x84, Key::F22 => 0x85, Key::F23 => 0x86, Key::F24 => 0x87,
         Key::Space => 0x20,
         Key::Tab => 0x09,
         Key::Enter => 0x0D,
@@ -1815,21 +1989,37 @@ fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
         Key::PageUp => 0x21, Key::PageDown => 0x22,
         Key::ArrowUp => 0x26, Key::ArrowDown => 0x28,
         Key::ArrowLeft => 0x25, Key::ArrowRight => 0x27,
+        Key::Semicolon | Key::Colon => 0xBA,
+        Key::Equals | Key::Plus => 0xBB,
+        Key::Comma => 0xBC,
+        Key::Minus => 0xBD,
+        Key::Period => 0xBE,
+        Key::Slash | Key::Questionmark => 0xBF,
+        Key::Backtick => 0xC0,
+        Key::OpenBracket => 0xDB,
+        Key::Backslash | Key::Pipe => 0xDC,
+        Key::CloseBracket => 0xDD,
+        Key::Quote => 0xDE,
         _ => return None,
     })
 }
-/// 当 egui 报告的是数字键（0x30-0x39）时，检查对应的小键盘键是否按下。
-/// 如果小键盘键按下，返回小键盘 VK code（0x60-0x69），否则返回原始值。
-/// 这样主键盘的「1」和小键盘的「1」可以分别绑定不同的快捷键。
+/// egui 分不清主键盘和小键盘上的同一个字符（「1」和小键盘「1」、「-」和小键盘「-」），
+/// 这里查一下对应的小键盘键是不是正按着，是就换成小键盘的 VK code，
+/// 这样两个键可以分别绑定不同的快捷键。
 #[cfg(windows)]
 fn disambiguate_numpad(vk: u32) -> u32 {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    if (0x30..=0x39).contains(&vk) {
-        let numpad_vk = vk - 0x30 + 0x60; // Digit0=0x30 -> Numpad0=0x60
-        unsafe {
-            if GetAsyncKeyState(numpad_vk as i32) < 0 {
-                return numpad_vk;
-            }
+    let numpad_vk = match vk {
+        0x30..=0x39 => vk - 0x30 + 0x60, // Digit0=0x30 -> Numpad0=0x60
+        0xBB => 0x6B,                    // = / + -> Num+
+        0xBD => 0x6D,                    // -     -> Num-
+        0xBE => 0x6E,                    // .     -> Num.
+        0xBF => 0x6F,                    // /     -> Num/
+        _ => return vk,
+    };
+    unsafe {
+        if GetAsyncKeyState(numpad_vk as i32) < 0 {
+            return numpad_vk;
         }
     }
     vk

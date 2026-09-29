@@ -1,9 +1,12 @@
-//! 全局热键：使用 Windows 低级键盘钩子（WH_KEYBOARD_LL）。
+//! 全局热键：使用 Windows 低级键盘钩子（WH_KEYBOARD_LL）+ 低级鼠标钩子（WH_MOUSE_LL）。
 //!
 //! 与 RegisterHotKey 不同，低级钩子有以下优势：
 //! - 不吞按键事件（始终调用 CallNextHookEx），绑定的键仍能正常打字。
 //! - 在全屏独占游戏中也能工作。
 //! - 用原始虚拟键码（VK code），精确区分主键盘数字键和小键盘数字键。
+//!
+//! 鼠标钩子只认中键和两个侧键，同样不吞事件。两个钩子装在同一个线程上，
+//! 共用一张绑定表和一套「按下去重」逻辑。
 //!
 //! 钩子回调运行在独立的 Windows 消息循环线程里，不依赖 egui 刷帧。
 use std::collections::HashMap;
@@ -33,38 +36,102 @@ const VK_RMENU: u32 = 0xA5;
 fn combo_key(mods: u8, vk: u32) -> u32 {
     ((mods as u32) << 16) | (vk & 0xFFFF)
 }
-/// VK code → 展示用 token 字符串。None 表示不支持绑定。
+/// 鼠标中键 / 侧键 1（后退）/ 侧键 2（前进）。Windows 本来就给它们分配了 VK code，
+/// 所以鼠标键和键盘键可以放进同一张绑定表，组合、去重、显示全都复用。
+pub const VK_MBUTTON: u32 = 0x04;
+pub const VK_XBUTTON1: u32 = 0x05;
+pub const VK_XBUTTON2: u32 = 0x06;
+/// 字母 / 数字 / 小键盘数字 / F 键以外的可绑定键：(VK code, 存储用 token, 显示名)。
+///
+/// token 会写进 `_schemes.json`，**不能改**；显示名随便改。
+/// 左右键不在表里 —— 绑上以后一点鼠标就触发，没法用。
+const NAMED_KEYS: &[(u32, &str, &str)] = &[
+    (VK_MBUTTON, "MouseMiddle", "Mouse3"),
+    (VK_XBUTTON1, "MouseX1", "Mouse4"),
+    (VK_XBUTTON2, "MouseX2", "Mouse5"),
+    (0x08, "Backspace", "Backspace"),
+    (0x09, "Tab", "Tab"),
+    (0x0C, "Clear", "Clear"),
+    (0x0D, "Enter", "Enter"),
+    (0x13, "Pause", "Pause"),
+    (0x14, "CapsLock", "CapsLock"),
+    (0x20, "Space", "Space"),
+    (0x21, "PageUp", "PageUp"),
+    (0x22, "PageDown", "PageDown"),
+    (0x23, "End", "End"),
+    (0x24, "Home", "Home"),
+    (0x25, "Left", "←"),
+    (0x26, "Up", "↑"),
+    (0x27, "Right", "→"),
+    (0x28, "Down", "↓"),
+    (0x2C, "PrintScreen", "PrtSc"),
+    (0x2D, "Insert", "Insert"),
+    (0x2E, "Delete", "Delete"),
+    (0x5D, "Apps", "Menu"),
+    (0x6A, "NumpadMultiply", "Num*"),
+    (0x6B, "NumpadAdd", "Num+"),
+    (0x6D, "NumpadSubtract", "Num-"),
+    (0x6E, "NumpadDecimal", "Num."),
+    (0x6F, "NumpadDivide", "Num/"),
+    (0x90, "NumLock", "NumLock"),
+    (0x91, "ScrollLock", "ScrollLock"),
+    (0xA6, "BrowserBack", "BrowserBack"),
+    (0xA7, "BrowserForward", "BrowserForward"),
+    (0xA8, "BrowserRefresh", "BrowserRefresh"),
+    (0xA9, "BrowserStop", "BrowserStop"),
+    (0xAA, "BrowserSearch", "BrowserSearch"),
+    (0xAB, "BrowserFavorites", "BrowserFavorites"),
+    (0xAC, "BrowserHome", "BrowserHome"),
+    (0xAD, "VolumeMute", "VolumeMute"),
+    (0xAE, "VolumeDown", "VolumeDown"),
+    (0xAF, "VolumeUp", "VolumeUp"),
+    (0xB0, "MediaNext", "MediaNext"),
+    (0xB1, "MediaPrev", "MediaPrev"),
+    (0xB2, "MediaStop", "MediaStop"),
+    (0xB3, "MediaPlayPause", "MediaPlay"),
+    (0xB4, "LaunchMail", "Mail"),
+    (0xB5, "LaunchMedia", "Media"),
+    (0xB6, "LaunchApp1", "App1"),
+    (0xB7, "LaunchApp2", "App2"),
+    (0xBA, "OemSemicolon", ";"),
+    (0xBB, "OemPlus", "="),
+    (0xBC, "OemComma", ","),
+    (0xBD, "OemMinus", "-"),
+    (0xBE, "OemPeriod", "."),
+    (0xBF, "OemQuestion", "/"),
+    (0xC0, "OemTilde", "`"),
+    (0xDB, "OemLeftBracket", "["),
+    (0xDC, "OemBackslash", "\\"),
+    (0xDD, "OemRightBracket", "]"),
+    (0xDE, "OemQuotes", "'"),
+    (0xE2, "Oem102", "Oem102"),
+];
+fn named(vk: u32) -> Option<&'static (u32, &'static str, &'static str)> {
+    NAMED_KEYS.iter().find(|(v, _, _)| *v == vk)
+}
+/// 这个 VK code 能不能绑。捕获时按到不能绑的键（Win 键之类）就继续等，不当成结果。
+pub fn is_bindable(vk: u32) -> bool {
+    matches!(vk, 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x69 | 0x70..=0x87) || named(vk).is_some()
+}
+/// VK code → 存储用 token 字符串。None 表示不支持绑定。
 fn vk_to_token(vk: u32) -> Option<String> {
     Some(match vk {
         0x41..=0x5A => format!("Key{}", (vk as u8) as char),
         0x30..=0x39 => format!("Digit{}", vk - 0x30),
         0x60..=0x69 => format!("Numpad{}", vk - 0x60),
-        0x70..=0x7B => format!("F{}", vk - 0x6F),
-        0x20 => "Space".into(),
-        0x08 => "Backspace".into(),
-        0x09 => "Tab".into(),
-        0x0D => "Enter".into(),
-        0x2D => "Insert".into(),
-        0x2E => "Delete".into(),
-        0x24 => "Home".into(),
-        0x23 => "End".into(),
-        0x21 => "PageUp".into(),
-        0x22 => "PageDown".into(),
-        0x26 => "Up".into(),
-        0x28 => "Down".into(),
-        0x25 => "Left".into(),
-        0x27 => "Right".into(),
-        0xBA => "OemSemicolon".into(),
-        0xBB => "OemPlus".into(),
-        0xBC => "OemComma".into(),
-        0xBD => "OemMinus".into(),
-        0xBE => "OemPeriod".into(),
-        0xC0 => "OemTilde".into(),
-        0xDB => "OemLeftBracket".into(),
-        0xDC => "OemBackslash".into(),
-        0xDD => "OemRightBracket".into(),
-        0xDE => "OemQuotes".into(),
-        _ => return None,
+        // F1–F24。F13 以上键盘上一般没有，是给鼠标宏 / 驱动映射用的。
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        _ => named(vk)?.1.to_string(),
+    })
+}
+/// VK code → 界面上显示的名字（比 token 短，符号键直接显示符号）。
+fn vk_to_display(vk: u32) -> Option<String> {
+    Some(match vk {
+        0x41..=0x5A => ((vk as u8) as char).to_string(),
+        0x30..=0x39 => (vk - 0x30).to_string(),
+        0x60..=0x69 => format!("Num{}", vk - 0x60),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        _ => named(vk)?.2.to_string(),
     })
 }
 /// token 字符串 → VK code。
@@ -77,45 +144,35 @@ fn token_to_vk(token: &str) -> Option<u32> {
             }
         }
     }
-    Some(match t.as_str() {
-        "digit0" | "0" => 0x30, "digit1" | "1" => 0x31,
-        "digit2" | "2" => 0x32, "digit3" | "3" => 0x33,
-        "digit4" | "4" => 0x34, "digit5" | "5" => 0x35,
-        "digit6" | "6" => 0x36, "digit7" | "7" => 0x37,
-        "digit8" | "8" => 0x38, "digit9" | "9" => 0x39,
-        "numpad0" => 0x60, "numpad1" => 0x61,
-        "numpad2" => 0x62, "numpad3" => 0x63,
-        "numpad4" => 0x64, "numpad5" => 0x65,
-        "numpad6" => 0x66, "numpad7" => 0x67,
-        "numpad8" => 0x68, "numpad9" => 0x69,
-        "f1" => 0x70, "f2" => 0x71, "f3" => 0x72,
-        "f4" => 0x73, "f5" => 0x74, "f6" => 0x75,
-        "f7" => 0x76, "f8" => 0x77, "f9" => 0x78,
-        "f10" => 0x79, "f11" => 0x7A, "f12" => 0x7B,
-        "space" => 0x20, "backspace" => 0x08,
-        "tab" => 0x09, "enter" => 0x0D,
-        "insert" => 0x2D, "delete" => 0x2E,
-        "home" => 0x24, "end" => 0x23,
-        "pageup" => 0x21, "pagedown" => 0x22,
-        "up" => 0x26, "down" => 0x28,
-        "left" => 0x25, "right" => 0x27,
-        "oemsemicolon" => 0xBA, "oemplus" => 0xBB,
-        "oemcomma" => 0xBC, "oemminus" => 0xBD,
-        "oemperiod" => 0xBE, "oemtilde" => 0xC0,
-        "oemleftbracket" => 0xDB, "oembackslash" => 0xDC,
-        "oemrightbracket" => 0xDD, "oemquotes" => 0xDE,
-        _ => return None,
-    })
+    let num = |prefix: &str| t.strip_prefix(prefix).and_then(|d| d.parse::<u32>().ok());
+    if let Some(d) = num("digit").filter(|d| *d <= 9) {
+        return Some(0x30 + d);
+    }
+    if let Some(d) = num("numpad").filter(|d| *d <= 9) {
+        return Some(0x60 + d);
+    }
+    if let Some(n) = num("f").filter(|n| (1..=24).contains(n)) {
+        return Some(0x6F + n);
+    }
+    if t.len() == 1 && t.as_bytes()[0].is_ascii_digit() {
+        return Some(0x30 + u32::from(t.as_bytes()[0] - b'0'));
+    }
+    NAMED_KEYS
+        .iter()
+        .find(|(_, tok, _)| tok.eq_ignore_ascii_case(&t))
+        .map(|(vk, _, _)| *vk)
 }
-/// 把 (mods, vk) 格式化成用户可读字符串，如 "Ctrl+Alt+KeyW"。
-pub fn format_combo(mods: u8, vk: u32) -> String {
-    let token = vk_to_token(vk).unwrap_or_else(|| format!("VK{vk:02X}"));
+fn join_combo(mods: u8, key: String) -> String {
     let mut parts = Vec::new();
-    if mods & MOD_CTRL != 0 { parts.push("Ctrl"); }
-    if mods & MOD_ALT != 0 { parts.push("Alt"); }
-    if mods & MOD_SHIFT != 0 { parts.push("Shift"); }
-    parts.push(&token);
+    if mods & MOD_CTRL != 0 { parts.push("Ctrl".to_string()); }
+    if mods & MOD_ALT != 0 { parts.push("Alt".to_string()); }
+    if mods & MOD_SHIFT != 0 { parts.push("Shift".to_string()); }
+    parts.push(key);
     parts.join("+")
+}
+/// 把 (mods, vk) 格式化成存储用字符串，如 "Ctrl+Alt+KeyW"。
+pub fn format_combo(mods: u8, vk: u32) -> String {
+    join_combo(mods, vk_to_token(vk).unwrap_or_else(|| format!("VK{vk:02X}")))
 }
 /// 解析存储的 combo 字符串 → (mods, vk)。None = 解析失败。
 pub fn parse_combo(combo: &str) -> Option<(u8, u32)> {
@@ -132,10 +189,10 @@ pub fn parse_combo(combo: &str) -> Option<(u8, u32)> {
     }
     vk.map(|v| (mods, v))
 }
-/// 把存储的 combo 字符串美化显示。
+/// 把存储的 combo 字符串美化显示，如 "Ctrl+Alt+KeyW" → "Ctrl+Alt+W"。
 pub fn pretty_combo(combo: &str) -> String {
     parse_combo(combo)
-        .map(|(m, v)| format_combo(m, v))
+        .and_then(|(m, v)| Some(join_combo(m, vk_to_display(v)?)))
         .unwrap_or_else(|| combo.to_string())
 }
 // ─── 共享状态 ───
@@ -169,6 +226,10 @@ struct HookShared {
     event_count: AtomicU64,
     /// 钩子被重装过几次（自愈次数）。
     reinstalls: AtomicU32,
+    /// 鼠标钩子装上了没有。装不上不影响键盘热键。
+    mouse_installed: AtomicBool,
+    /// 鼠标钩子最近一次收到任意鼠标事件（含移动）的时刻，给看门狗用。
+    mouse_last_event: AtomicU64,
 }
 /// 钩子回调要用到的共享状态。回调是**系统级热路径**（每一次按键都会走），
 /// 所以这里用 OnceLock 而不是 Mutex：回调里不加锁，避免被 UI 线程卡住 ——
@@ -197,6 +258,8 @@ impl Hotkeys {
             last_event: AtomicU64::new(0),
             event_count: AtomicU64::new(0),
             reinstalls: AtomicU32::new(0),
+            mouse_installed: AtomicBool::new(false),
+            mouse_last_event: AtomicU64::new(0),
         });
         #[cfg(windows)]
         {
@@ -271,6 +334,10 @@ impl Hotkeys {
     pub fn reinstalls(&self) -> u32 {
         self.shared.reinstalls.load(Ordering::Relaxed)
     }
+    /// 鼠标钩子是否装上了（没装上时鼠标键绑定只在窗口前台时有效）。
+    pub fn mouse_installed(&self) -> bool {
+        self.shared.mouse_installed.load(Ordering::Relaxed)
+    }
     /// 用 VK code 直接触发（egui 前台后备路径调用）。
     pub fn trigger_from_vk(&self, mods: u8, vk: u32) {
         self.shared.fire(mods, vk, Src::Egui);
@@ -339,29 +406,39 @@ mod win {
    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetMessageW, KillTimer, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
-        HHOOK, MSG, WH_KEYBOARD_LL,
+        HHOOK, MSG, WH_KEYBOARD_LL, WH_MOUSE_LL,
     };
-    // hook_callback 在父模块里用到这两个，所以 pub(super)
+    // 回调在父模块里用到这几个，所以 pub(super)
     pub(super) use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, KBDLLHOOKSTRUCT,
+        CallNextHookEx, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT,
     };
     pub(super) const HC_ACTION: i32 = 0;
     pub(super) const WM_KEYDOWN: usize = 0x0100;
     pub(super) const WM_KEYUP: usize = 0x0101;
     pub(super) const WM_SYSKEYDOWN: usize = 0x0104;
     pub(super) const WM_SYSKEYUP: usize = 0x0105;
-    pub(super) unsafe fn install_hook() -> Option<HHOOK> {
+    pub(super) const WM_MBUTTONDOWN: usize = 0x0207;
+    pub(super) const WM_MBUTTONUP: usize = 0x0208;
+    pub(super) const WM_XBUTTONDOWN: usize = 0x020B;
+    pub(super) const WM_XBUTTONUP: usize = 0x020C;
+    unsafe fn install(id: i32, proc_: unsafe extern "system" fn(i32, usize, isize) -> isize) -> Option<HHOOK> {
         let hinst = GetModuleHandleW(std::ptr::null_mut());
         if hinst.is_null() {
             log::error!("GetModuleHandleW 失败");
             return None;
         }
-        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hinst, 0);
+        let hook = SetWindowsHookExW(id, Some(proc_), hinst, 0);
         if hook.is_null() {
-            log::error!("SetWindowsHookExW 失败");
+            log::error!("SetWindowsHookExW({id}) 失败");
             return None;
         }
         Some(hook)
+    }
+    pub(super) unsafe fn install_hook() -> Option<HHOOK> {
+        install(WH_KEYBOARD_LL, hook_proc)
+    }
+    pub(super) unsafe fn install_mouse_hook() -> Option<HHOOK> {
+        install(WH_MOUSE_LL, mouse_proc)
     }
     /// 消息循环 + 看门狗。
     ///
@@ -370,7 +447,13 @@ mod win {
     /// 表现就是「用着用着热键突然不响，重启才好」。
     /// 所以这里挂一个 1.5 秒的定时器：一段时间内一个键盘事件都没收到，
     /// 就当钩子已经死了，摘掉重装一次。装得上就自动恢复，不用重启。
-    pub(super) unsafe fn run_message_loop(shared: &std::sync::Arc<super::HookShared>, hook: &mut HHOOK) {
+    ///
+    /// 鼠标钩子同理，按它自己的心跳（鼠标移动也算）单独判断、单独重装。
+    pub(super) unsafe fn run_message_loop(
+        shared: &std::sync::Arc<super::HookShared>,
+        hook: &mut HHOOK,
+        mouse: &mut Option<HHOOK>,
+    ) {
         use std::sync::atomic::Ordering;
         const WM_TIMER: u32 = 0x0113;
         /// 多久没有任何键盘事件就重装一次钩子。
@@ -396,6 +479,15 @@ mod win {
             }
             if msg.message != WM_TIMER {
                 continue;
+            }
+            let mouse_idle = super::now_ms().saturating_sub(shared.mouse_last_event.load(Ordering::Relaxed));
+            if mouse_idle >= IDLE_REINSTALL_MS {
+                if let Some(h) = mouse.take() {
+                    UnhookWindowsHookEx(h);
+                }
+                *mouse = install_mouse_hook();
+                shared.mouse_installed.store(mouse.is_some(), Ordering::Relaxed);
+                shared.mouse_last_event.store(super::now_ms(), Ordering::Relaxed);
             }
             let idle = super::now_ms().saturating_sub(shared.last_event.load(Ordering::Relaxed));
             if idle < IDLE_REINSTALL_MS {
@@ -448,6 +540,9 @@ mod win {
     unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
         crate::hotkeys::hook_callback(code, wparam, lparam)
     }
+    unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
+        crate::hotkeys::mouse_callback(code, wparam, lparam)
+    }
 }
 #[cfg(windows)]
 fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
@@ -461,43 +556,76 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
                 // 心跳：看门狗靠它判断「钩子是不是已经被系统悄悄摘掉了」。
                 shared.event_count.fetch_add(1, Ordering::Relaxed);
                 shared.last_event.store(now_ms(), Ordering::Relaxed);
-                if shared.capturing.load(Ordering::Relaxed) {
-                    if is_down && !is_modifier_key(vk) {
-                        let result = if vk == VK_ESCAPE { None } else { Some((win::get_modifiers(), vk)) };
-                        shared.capturing.store(false, Ordering::Relaxed);
-                        if let Ok(slot) = shared.capture_tx.lock() {
-                            if let Some(tx) = slot.as_ref() { let _ = tx.send(result); }
-                        }
-                    }
-                } else {
-                    let mods = win::get_modifiers();
-                    // 「这个键是不是已经按着」必须只按 vk 记，**不能带修饰键**：
-                    // 按下时 mods 和松开时 mods 可能不一样（游戏里 Shift/Ctrl 常年按着，
-                    // 中途按一下或松一下就变了），键不同就配不上对，
-                    // 松开的记录删不掉，这个键从此被当成「一直按着」，再也不会触发。
-                    // 这就是「后台按键突然不响，重启才好」的根因。
-                    if is_down {
-                        let now = now_ms();
-                        let already_down = DOWN_KEYS.with(|dk| {
-                            let mut dk = dk.borrow_mut();
-                            // 兜底：万一漏收了 key-up（切到安全桌面、钩子被临时摘掉等），
-                            // 超过 STALE_MS 没再收到该键任何事件就视为已松开。
-                            dk.retain(|_, t| now.saturating_sub(*t) < STALE_MS);
-                            // insert 返回旧值：有旧值 = 之前就按着（自动重复），
-                            // 同时刷新时间戳，所以一直按着的键不会被上面的清理误伤。
-                            dk.insert(vk, now).is_some()
-                        });
-                        if !already_down {
-                            shared.fire(mods, vk, Src::Hook);
-                        }
-                    } else if is_up {
-                        DOWN_KEYS.with(|dk| { dk.borrow_mut().remove(&vk); });
-                    }
-                }
+                on_button(shared, vk, is_down);
             }
         }
     }
     unsafe { win::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+/// 鼠标钩子回调。每一次鼠标移动都会走这里，所以除了中键 / 侧键，其他事件只记个心跳就放行。
+#[cfg(windows)]
+fn mouse_callback(code: i32, wparam: usize, lparam: isize) -> isize {
+    if code == win::HC_ACTION {
+        if let Some(shared) = SHARED.get().filter(|s| s.active.load(Ordering::Relaxed)) {
+            shared.mouse_last_event.store(now_ms(), Ordering::Relaxed);
+            let button = match wparam {
+                win::WM_MBUTTONDOWN => Some((VK_MBUTTON, true)),
+                win::WM_MBUTTONUP => Some((VK_MBUTTON, false)),
+                win::WM_XBUTTONDOWN | win::WM_XBUTTONUP => {
+                    let ms = unsafe { &*(lparam as *const win::MSLLHOOKSTRUCT) };
+                    // 高 16 位：1 = XBUTTON1（侧键后退），2 = XBUTTON2（侧键前进）
+                    let vk = match (ms.mouseData >> 16) & 0xFFFF {
+                        1 => Some(VK_XBUTTON1),
+                        2 => Some(VK_XBUTTON2),
+                        _ => None,
+                    };
+                    vk.map(|vk| (vk, wparam == win::WM_XBUTTONDOWN))
+                }
+                _ => None,
+            };
+            if let Some((vk, is_down)) = button {
+                on_button(shared, vk, is_down);
+            }
+        }
+    }
+    unsafe { win::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+/// 键盘和鼠标钩子共用的按键处理：捕获模式下交出结果，否则按下去重后触发。
+#[cfg(windows)]
+fn on_button(shared: &HookShared, vk: u32, is_down: bool) {
+    if shared.capturing.load(Ordering::Relaxed) {
+        // 修饰键本身、以及不能绑的键（Win 键之类）都不算结果，继续等下一个键。
+        if is_down && !is_modifier_key(vk) && (vk == VK_ESCAPE || is_bindable(vk)) {
+            let result = if vk == VK_ESCAPE { None } else { Some((win::get_modifiers(), vk)) };
+            shared.capturing.store(false, Ordering::Relaxed);
+            if let Ok(slot) = shared.capture_tx.lock() {
+                if let Some(tx) = slot.as_ref() { let _ = tx.send(result); }
+            }
+        }
+        return;
+    }
+    // 「这个键是不是已经按着」必须只按 vk 记，**不能带修饰键**：
+    // 按下时 mods 和松开时 mods 可能不一样（游戏里 Shift/Ctrl 常年按着，
+    // 中途按一下或松一下就变了），键不同就配不上对，
+    // 松开的记录删不掉，这个键从此被当成「一直按着」，再也不会触发。
+    // 这就是「后台按键突然不响，重启才好」的根因。
+    if is_down {
+        let now = now_ms();
+        let already_down = DOWN_KEYS.with(|dk| {
+            let mut dk = dk.borrow_mut();
+            // 兜底：万一漏收了 key-up（切到安全桌面、钩子被临时摘掉等），
+            // 超过 STALE_MS 没再收到该键任何事件就视为已松开。
+            dk.retain(|_, t| now.saturating_sub(*t) < STALE_MS);
+            // insert 返回旧值：有旧值 = 之前就按着（自动重复），
+            // 同时刷新时间戳，所以一直按着的键不会被上面的清理误伤。
+            dk.insert(vk, now).is_some()
+        });
+        if !already_down {
+            shared.fire(win::get_modifiers(), vk, Src::Hook);
+        }
+    } else {
+        DOWN_KEYS.with(|dk| { dk.borrow_mut().remove(&vk); });
+    }
 }
 /// 多久没再收到某个键的事件就认为它已经松开（漏收 key-up 时的兜底）。
 #[cfg(windows)]
@@ -522,8 +650,18 @@ fn hook_thread(shared: Arc<HookShared>) {
         };
         shared.hook_installed.store(true, Ordering::Relaxed);
         log::info!("低级键盘钩子已安装");
-        win::run_message_loop(&shared, &mut hook);
+        let mut mouse = win::install_mouse_hook();
+        shared.mouse_installed.store(mouse.is_some(), Ordering::Relaxed);
+        shared.mouse_last_event.store(now_ms(), Ordering::Relaxed);
+        if mouse.is_some() {
+            log::info!("低级鼠标钩子已安装");
+        }
+        win::run_message_loop(&shared, &mut hook, &mut mouse);
         win::remove_hook(hook);
+        if let Some(m) = mouse {
+            win::remove_hook(m);
+        }
+        shared.mouse_installed.store(false, Ordering::Relaxed);
         shared.hook_installed.store(false, Ordering::Relaxed);
         log::info!("低级键盘钩子已卸载");
     }

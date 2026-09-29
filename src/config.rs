@@ -7,7 +7,7 @@
 //! └─ profiles\          # 每个子文件夹 = 一个配置（profile）
 //!    └─ 默认\
 //!       ├─ xxx.mp3       # 用户丢进来的音频
-//!       └─ _bindings.json
+//!       └─ _schemes.json # 这批音频的几套方案（键位 / 音量 / 顺序 + 设备和播放设置）
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,60 @@ impl Default for AppConfig {
             window_w: None,
             window_h: None,
         }
+    }
+}
+
+/// 跟着「方案」走的那部分设置。切方案时整体换掉，改了就自动存回当前方案。
+///
+/// 外观、语言、窗口位置、开机自启这些跟人走、不跟方案走，所以不在这里。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchemeSettings {
+    pub output_device: Option<String>,
+    pub input_device: Option<String>,
+    pub monitor_device: Option<String>,
+    pub capture_device: Option<String>,
+    pub effect_volume: f32,
+    pub mic_passthrough: bool,
+    pub stop_hotkey: Option<String>,
+    pub repeat_mode: RepeatMode,
+    pub sort_mode: SortMode,
+    pub view_mode: ViewMode,
+}
+
+impl Default for SchemeSettings {
+    fn default() -> Self {
+        Self::from_config(&AppConfig::default())
+    }
+}
+
+impl SchemeSettings {
+    pub fn from_config(c: &AppConfig) -> Self {
+        Self {
+            output_device: c.output_device.clone(),
+            input_device: c.input_device.clone(),
+            monitor_device: c.monitor_device.clone(),
+            capture_device: c.capture_device.clone(),
+            effect_volume: c.effect_volume,
+            mic_passthrough: c.mic_passthrough,
+            stop_hotkey: c.stop_hotkey.clone(),
+            repeat_mode: c.repeat_mode,
+            sort_mode: c.sort_mode,
+            view_mode: c.view_mode,
+        }
+    }
+
+    pub fn apply_to(&self, c: &mut AppConfig) {
+        c.output_device = self.output_device.clone();
+        c.input_device = self.input_device.clone();
+        c.monitor_device = self.monitor_device.clone();
+        c.capture_device = self.capture_device.clone();
+        c.effect_volume = self.effect_volume;
+        c.mic_passthrough = self.mic_passthrough;
+        c.stop_hotkey = self.stop_hotkey.clone();
+        c.repeat_mode = self.repeat_mode;
+        c.sort_mode = self.sort_mode;
+        c.view_mode = self.view_mode;
     }
 }
 

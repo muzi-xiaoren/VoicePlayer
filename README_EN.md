@@ -9,7 +9,13 @@ chat can hear them — while **your normal speech is unaffected**.
 ## Features
 
 - **Multi-sound mixing**: multiple sounds play simultaneously without interfering
-- **Hotkey binding**: bind a global hotkey per sound, plus a dedicated "stop all" hotkey
+- **Hotkey binding**: bind a global hotkey per sound, plus a dedicated "stop all" hotkey. Almost every key works:
+  letters, digits, symbol keys, the numpad (including `+ - * / .`), F1–F24, arrows,
+  PrintScreen / ScrollLock / Pause, media keys, all combinable with Ctrl / Alt / Shift
+- **Mouse button binding**: middle button and the two side buttons (shown as Mouse3 / Mouse4 / Mouse5).
+  Extra macro buttons from mouse software (G HUB, Synapse, …) are invisible to Windows — map them to F13–F24 in that software and bind those
+- **Schemes**: keep several schemes for the same sounds (e.g. one per game), each with its own hotkeys, volumes and order,
+  plus devices, master volume, stop key, repeat behaviour and mic passthrough; switch from the "Scheme" dropdown, changes are saved automatically
 - **Main-row / numpad independent binding**: main-row 1 and numpad 1 can be bound to different sounds
 - **One-click lock**: when locked, hotkeys won't trigger any sound
 - **Non-blocking keys**: bound keys still type normally — no key swallowing
@@ -39,6 +45,9 @@ Since mixing happens inside the app, **you don't need VoiceMeeter** — just a s
 1. Install [VB-CABLE](https://vb-audio.com/Cable/) and restart your computer.
 2. Open VoicePlayer, set **Output device** to `CABLE Input (VB-Audio Virtual Cable)`.
 3. In your game / Discord, set **microphone** to `CABLE Output (VB-Audio Virtual Cable)`.
+   Tired of changing it in every game? Make `CABLE Output` the Windows **default recording device** and pick "Default" in the game.
+   Then set VoicePlayer's "Microphone" **explicitly to your real mic** instead of "System default" —
+   otherwise it would record its own output; the app skips passthrough and warns in Settings.
 4. Click "Open folder", drop mp3 / wav / ogg / flac files in — they auto-appear in the list.
 5. Click "Set hotkey" for each sound and press your desired key combination.
 6. (Optional) To hear effects yourself, set "Monitor device" to your headphones.
@@ -84,7 +93,7 @@ Config and audio live in `%APPDATA%\VoicePlayer\`:
 └─ profiles\
    └─ Default\
       ├─ xxx.mp3
-      └─ _bindings.json   # hotkey bindings
+      └─ _schemes.json    # schemes for these sounds (hotkeys / volumes / order + devices and playback settings)
 ```
 
 ## Building from Source
