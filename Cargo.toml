@@ -28,15 +28,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Globalization",
-    "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
-    "Win32_System_Threading",
     "Win32_System_Registry",
-    "Win32_Media_Audio",
-    "Win32_System_Com",
-    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 # 体积优先的 release 配置：strip + LTO + 最小体积优化

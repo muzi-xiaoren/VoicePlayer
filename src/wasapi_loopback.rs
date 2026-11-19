@@ -1,6 +1,6 @@
 //! WASAPI 系统音频环回捕获。
 //!
-//! 捕获默认播放设备正在播放的音频，推入环形缓冲区，
+//! 捕获某个播放设备（默认是系统默认设备）正在播放的音频，推入环形缓冲区，
 //! 供 LoopbackSource 通过 rodio 混入虚拟麦克风。
 
 use std::collections::VecDeque;
@@ -301,39 +301,26 @@ mod ffi {
         let bps = (bits / 8) as usize;
         let ch = channels as usize;
         let fb = bps * ch;
-        let Ok(mut b) = buf.samples.lock() else { return };
-        for frame in 0..num_frames {
-            let off = frame * fb;
-            if off + fb > data.len() { break; }
-            let (l, r) = if ch >= 2 {
-                (read_sample(&data[off..], bps, is_float),
-                 read_sample(&data[off + bps..], bps, is_float))
-            } else {
-                let s = read_sample(&data[off..], bps, is_float);
-                (s, s)
-            };
-            b.push_back(l);
-            b.push_back(r);
+        if fb == 0 { return; }
+        // 先在锁外解成立体声，再整段塞进队列：播放回调每取一个样本都要抢这把锁，
+        // 持锁时间越短越好；两路消费者也不用各解一遍。
+        let mut stereo: Vec<f32> = Vec::with_capacity(num_frames * 2);
+        for frame in data.chunks_exact(fb).take(num_frames) {
+            let l = read_sample(frame, bps, is_float);
+            let r = if ch >= 2 { read_sample(&frame[bps..], bps, is_float) } else { l };
+            stereo.push(l);
+            stereo.push(r);
         }
-        while b.len() > LoopbackBuf::CAP { b.pop_front(); }
-        drop(b);
-        if buf.mon_enabled.load(Ordering::Relaxed) {
-            if let Ok(mut m) = buf.mon.lock() {
-                for frame in 0..num_frames {
-                    let off = frame * fb;
-                    if off + fb > data.len() { break; }
-                    let (l, r) = if ch >= 2 {
-                        (read_sample(&data[off..], bps, is_float),
-                         read_sample(&data[off + bps..], bps, is_float))
-                    } else {
-                        let s = read_sample(&data[off..], bps, is_float);
-                        (s, s)
-                    };
-                    m.push_back(l);
-                    m.push_back(r);
-                }
-                while m.len() > LoopbackBuf::CAP { m.pop_front(); }
+        let push = |q: &Mutex<VecDeque<f32>>| {
+            if let Ok(mut b) = q.lock() {
+                b.extend(stereo.iter().copied());
+                let over = b.len().saturating_sub(LoopbackBuf::CAP);
+                b.drain(..over);
             }
+        };
+        push(&buf.samples);
+        if buf.mon_enabled.load(Ordering::Relaxed) {
+            push(&buf.mon);
         }
     }
 

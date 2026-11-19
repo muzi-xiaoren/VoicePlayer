@@ -44,9 +44,10 @@ pub fn input_devices() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 有没有检测到 VB-CABLE（按设备名里含 "CABLE Input" 判断）。
-pub fn vbcable_installed() -> bool {
-    output_devices().iter().any(|n| n.contains("CABLE Input"))
+/// 输出设备列表里的 VB-CABLE（按设备名里含 "CABLE Input" 判断）。
+/// 找到 = 装了 VB-CABLE，同时它也是默认该选的输出设备。
+pub fn find_cable(output_devices: &[String]) -> Option<&String> {
+    output_devices.iter().find(|n| n.contains("CABLE Input"))
 }
 
 /// 系统默认播放设备名。WASAPI 环回捕获抓的就是这个设备，
@@ -103,11 +104,6 @@ pub fn mic_loops_into_output(input: Option<&str>, output: Option<&str>) -> bool 
         (Some(i), Some(o)) => i.contains("CABLE") && i.replacen("Output", "Input", 1) == o,
         _ => false,
     }
-}
-
-/// 猜一个默认应该选的输出设备名：优先 VB-CABLE 的 CABLE Input。
-pub fn guess_cable_output() -> Option<String> {
-    output_devices().into_iter().find(|n| n.contains("CABLE Input"))
 }
 
 fn find_output_device(name: Option<&str>) -> Result<cpal::Device> {
@@ -274,9 +270,9 @@ fn audio_thread(
                 AudioCmd::SetEffectVolume(v) => {
                     cfg.effect_volume = v;
                     if let Some(en) = &mut engine {
-                       en.set_effect_volume(v);
-                   }
-               }
+                        en.set_effect_volume(v);
+                    }
+                }
                 AudioCmd::SetRepeatMode(m) => cfg.repeat_mode = m,
                 AudioCmd::SetLoopbackVolume(v) => {
                     cfg.loopback_volume = v;
@@ -347,7 +343,7 @@ struct AudioEngine {
     _mic_stream: Option<cpal::Stream>,
     mic_enabled: Arc<AtomicBool>,
     effect_volume: f32,
-    _loopback_thread: Option<std::thread::JoinHandle<()>>,
+    loopback_thread: Option<std::thread::JoinHandle<()>>,
     loopback_stop: Arc<AtomicBool>,
     loopback_vol: Arc<std::sync::atomic::AtomicU32>,
     /// 按音频文件分组的活跃音轨（同一文件可有多条 = 叠加播放）。
@@ -395,9 +391,25 @@ impl AudioEngine {
         let loopback_vol = Arc::new(std::sync::atomic::AtomicU32::new(
             cfg.loopback_volume.to_bits(),
         ));
-        let _loopback_thread: Option<std::thread::JoinHandle<()>> = if cfg.loopback_enabled {
+        let loopback_thread: Option<std::thread::JoinHandle<()>> = if cfg.loopback_enabled {
             let cap = cfg.capture_device.as_deref();
             let buf = LoopbackBuf::new();
+            // 捕获线程要先起来：rodio 在 play_raw 那一刻就把音源的采样率读走、
+            // 之后再也不问，而采样率要等捕获线程打开设备才知道。
+            // 以前是先 play_raw 再起线程，采样率永远按兜底的 48k 算，
+            // 设备只要不是 48k（44.1k / 96k 很常见）捕到的声音就变调。
+            let thread = wasapi_loopback::start_loopback_thread(
+                buf.clone(),
+                loopback_stop.clone(),
+                cfg.capture_device.clone(),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while buf.sample_rate.get().is_none()
+                && !thread.is_finished()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             // 主输出（虚拟麦克风）。捕获源就是主输出时不能送，否则自己抓自己滚成啸叫 ——
             // 「把网易云单独指到 CABLE Input」的玩法就会命中这一条：
             // 声音本来就已经在 CABLE 里了，队友听得到，这边只需要给自己开监听。
@@ -432,11 +444,7 @@ impl AudioEngine {
                 ),
                 (None, _) => {}
             }
-            Some(wasapi_loopback::start_loopback_thread(
-                buf,
-                loopback_stop.clone(),
-                cfg.capture_device.clone(),
-            ))
+            Some(thread)
         } else {
             None
         };
@@ -449,7 +457,7 @@ impl AudioEngine {
             _mic_stream: mic_stream,
             mic_enabled,
             effect_volume: cfg.effect_volume,
-            _loopback_thread,
+            loopback_thread,
             loopback_stop,
             loopback_vol,
             voices: HashMap::new(),
@@ -625,9 +633,9 @@ impl AudioEngine {
         self.mic_enabled.store(on, Ordering::Relaxed);
     }
 
-   /// 运行时调全局音效音量（同步作用到正在播的音轨）。
-   fn set_effect_volume(&mut self, v: f32) {
-       self.effect_volume = v;
+    /// 运行时调全局音效音量（同步作用到正在播的音轨）。
+    fn set_effect_volume(&mut self, v: f32) {
+        self.effect_volume = v;
         for vs in self.voices.values() {
             for voice in vs {
                 voice.sink.set_volume(v * voice.base);
@@ -653,7 +661,7 @@ impl AudioEngine {
 
     fn shutdown(&mut self) {
         self.loopback_stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self._loopback_thread.take() {
+        if let Some(h) = self.loopback_thread.take() {
             let _ = h.join();
         }
     }

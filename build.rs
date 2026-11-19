@@ -1,4 +1,4 @@
-//! 把 Windows 可执行文件图标嵌入 exe（仅 release 构建）。
+//! 把 Windows 可执行文件图标嵌入 exe。
 //! 图标来自 assets/icon.ico。
 
 fn main() {

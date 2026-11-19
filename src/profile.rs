@@ -30,7 +30,7 @@ pub struct Sound {
     pub modified: std::time::SystemTime,
 }
 
-/// 持久化到 `_bindings.json` 的单条绑定信息。
+/// 持久化到 `_schemes.json` 的单条绑定信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Binding {
     #[serde(default)]

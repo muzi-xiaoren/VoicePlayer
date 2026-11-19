@@ -83,6 +83,20 @@ Best for sending only **one app's** audio into the virtual mic while leaving oth
 
 > For example, if you set NetEase Cloud Music's output to CABLE Input, your teammates will hear your music; meanwhile your browser video audio still plays from your speakers as usual.
 
+## Troubleshooting
+
+The app writes a log to `voiceplayer.log` in the data directory (there is an "Open log folder" button next to
+"Hotkey diagnostics" on the Settings page).
+
+**A hotkey does nothing**: look at the "Hotkey diagnostics" row on the Settings page first.
+
+- `hook=off` — the hook could not be installed. There are no global hotkeys; they only work while the window is focused.
+- `hook=on` but `events=0` — the hook is installed but receives no key events, so Windows is blocking it.
+  The usual cause is that **the foreground app (a game or its anti-cheat) runs elevated while this app does not** —
+  right-click VoicePlayer and pick "Run as administrator".
+- `reinstalls` counts preventive re-installs: Windows gives no notice when it drops a hook, so the hook is re-installed
+  whenever no key event arrives for a few seconds. It keeps rising while you are not typing — that is normal.
+
 ## Data Directory
 
 Config and audio live in `%APPDATA%\VoicePlayer\`:
@@ -105,7 +119,7 @@ cargo run            # debug run
 cargo build --release
 ```
 
-Releasing: push a `v`-prefixed tag (e.g., `v0.0.3`) and GitHub Actions will
+Releasing: push a `v`-prefixed tag (e.g., `v1.0.0`) and GitHub Actions will
 automatically build a portable zip + installer and publish to Releases.
 
 ## License

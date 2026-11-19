@@ -233,7 +233,6 @@ pub fn apply(ctx: &Context, light: bool, bg: Option<[u8; 3]>, has_bg_image: bool
     v.warn_fg_color = pal.warn;
     v.error_fg_color = pal.danger;
 
-    let on_accent = if pal.light { Color32::WHITE } else { Color32::WHITE };
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = pal.surface;
     w.noninteractive.weak_bg_fill = pal.surface;
@@ -257,7 +256,7 @@ pub fn apply(ctx: &Context, light: bool, bg: Option<[u8; 3]>, has_bg_image: bool
     w.active.bg_fill = pal.accent;
     w.active.weak_bg_fill = pal.accent;
     w.active.bg_stroke = Stroke::new(1.0, pal.accent);
-    w.active.fg_stroke = Stroke::new(1.0, on_accent);
+    w.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     w.active.rounding = Rounding::same(R_CTRL);
     w.active.expansion = 0.0;
 

@@ -91,7 +91,6 @@ struct Pending {
     clear_stop: bool,
     set_volume: Vec<(usize, f32)>,
     open_folder: bool,
-    reregister: bool,
     lock_toggled: bool,
     lang_changed: bool,
     /// 把第 .0 项移动到第 .1 项的位置。
@@ -102,7 +101,6 @@ struct Pending {
     grip_pressed: Option<usize>,
     pick_bg_image: bool,
     clear_bg_image: bool,
-    retheme: bool,
 }
 pub struct App {
     config: AppConfig,
@@ -131,17 +129,24 @@ pub struct App {
     drag: std::cell::RefCell<Option<DragState>>,
     /// 上一帧量到的卡片真实高度 [网格, 列表]。0 = 还没量过，先用公式估。
     card_h: std::cell::Cell<[f32; 2]>,
-   last_scan: Instant,
-   /// 进程启动时刻。用来判断「开了这么久还一个按键都没收到」= 钩子被挡了。
-   started: Instant,
-   last_signature: Vec<String>,
-   lang: i18n::Lang,
+    last_scan: Instant,
+    /// 进程启动时刻。用来判断「开了这么久还一个按键都没收到」= 钩子被挡了。
+    started: Instant,
+    last_signature: Vec<String>,
+    lang: i18n::Lang,
     last_window_save: Instant,
+    /// 有音量改动还没落盘（拖滑块时每帧都在变，等松手再写）。
+    bindings_dirty: bool,
+    /// 设置页的三条设备告警：(麦克风录到自己的输出, 监听设备就是捕获源, 捕获源就是主输出)。
+    /// 判断它们要问系统「默认设备是谁」，不便宜，所以隔一会儿算一次存在这儿，不每帧算。
+    dev_warn: (bool, bool, bool),
+    /// 上次算 `dev_warn` 的时刻。None = 设备设置刚变过，下一帧立刻重算。
+    last_dev_check: Option<Instant>,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-       install_cjk_fonts(&cc.egui_ctx);
-       let mut config = AppConfig::load();
+        install_cjk_fonts(&cc.egui_ctx);
+        let mut config = AppConfig::load();
         theme::apply(
             &cc.egui_ctx,
             matches!(config.theme_mode, ThemeMode::Light),
@@ -152,9 +157,10 @@ impl App {
         let texts = i18n::Texts::new(lang);
         let out_devices = audio::output_devices();
         let in_devices = audio::input_devices();
-        let vbcable = audio::vbcable_installed();
+        let cable = audio::find_cable(&out_devices).cloned();
+        let vbcable = cable.is_some();
         if config.output_device.is_none() {
-            config.output_device = audio::guess_cable_output();
+            config.output_device = cable;
         }
         let profiles = Self::all_profiles(&config, texts.default_profile);
         let active = config
@@ -210,12 +216,15 @@ impl App {
             theme_sig: None,
             drag: std::cell::RefCell::new(None),
             card_h: std::cell::Cell::new([0.0, 0.0]),
-           last_scan: Instant::now(),
-           started: Instant::now(),
-           last_signature,
-           lang,
+            last_scan: Instant::now(),
+            started: Instant::now(),
+            last_signature,
+            lang,
             last_window_save: Instant::now(),
-       };
+            bindings_dirty: false,
+            dev_warn: (false, false, false),
+            last_dev_check: None,
+        };
         app.config.save();
         app.reregister_hotkeys();
         app
@@ -276,6 +285,7 @@ impl App {
     /// 换了 profile 或方案之后调用：把这套方案记下的设置换上来，
     /// 并让列表顺序、音频引擎、热键都跟上。
     fn adopt_scheme(&mut self) {
+        self.cancel_capture();
         let saved = self.profile.as_ref().and_then(|p| p.settings().cloned());
         if let Some(s) = saved.filter(|s| *s != SchemeSettings::from_config(&self.config)) {
             s.apply_to(&mut self.config);
@@ -288,7 +298,7 @@ impl App {
         }
         self.reregister_hotkeys();
     }
-    fn add_external_folder(&mut self, dir: PathBuf, _dialog_title: &str) {
+    fn add_external_folder(&mut self, dir: PathBuf) {
         if let Some(name) = self
             .config
             .external_profiles
@@ -348,7 +358,31 @@ impl App {
     fn refresh_devices(&mut self) {
         self.out_devices = audio::output_devices();
         self.in_devices = audio::input_devices();
-        self.vbcable = audio::vbcable_installed();
+        self.vbcable = audio::find_cable(&self.out_devices).is_some();
+        self.last_dev_check = None;
+    }
+    /// 重算设置页的设备告警。只在设置页开着时调，一秒最多一次。
+    fn refresh_dev_warn(&mut self) {
+        if self.last_dev_check.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        self.last_dev_check = Some(Instant::now());
+        let c = &self.config;
+        let cap = c.capture_device.as_deref();
+        self.dev_warn = (
+            audio::mic_loops_into_output(c.input_device.as_deref(), c.output_device.as_deref()),
+            audio::loopback_monitor_conflicts(c.monitor_device.as_deref(), cap),
+            audio::same_output(cap, c.output_device.as_deref()),
+        );
+    }
+    /// 放弃正在进行的快捷键捕获。列表内容或顺序要变之前调：
+    /// 捕获目标记的是下标，列表一变就指到别的音效上去了。
+    fn cancel_capture(&mut self) {
+        if self.capturing.take().is_some() {
+            if let Some(hk) = &self.hotkeys {
+                hk.stop_capture();
+            }
+        }
     }
     fn maybe_rescan(&mut self) {
         if self.last_scan.elapsed() < Duration::from_millis(1500) {
@@ -360,6 +394,13 @@ impl App {
             let sig = Profile::file_signature(&dir);
             if sig != self.last_signature {
                 self.last_signature = sig;
+                self.cancel_capture();
+                // 重新加载是从盘上读的，没落盘的音量改动先写下去，别被读回来的旧值盖掉。
+                if std::mem::take(&mut self.bindings_dirty) {
+                    if let Some(p) = self.profile.as_mut() {
+                        p.save_bindings();
+                    }
+                }
                 let mut p = Profile::load(&name, &dir, self.texts().default_scheme);
                 p.apply_sort(self.config.sort_mode);
                 self.profile = Some(p);
@@ -367,7 +408,7 @@ impl App {
             }
         }
     }
-   /// 轮询钩子线程的捕获结果。
+    /// 轮询钩子线程的捕获结果。
     fn handle_capture(&mut self, ctx: &egui::Context) {
         if self.capturing.is_none() {
             return;
@@ -422,9 +463,8 @@ impl App {
         }
     }
     fn apply(&mut self, pending: Pending) {
-       let texts = self.texts();
-        let mut need_reregister = pending.reregister;
-        let mut need_retheme = pending.retheme;
+        let texts = self.texts();
+        let mut need_reregister = false;
         for (i, v) in pending.set_volume {
             if let Some(p) = self.profile.as_mut() {
                 if let Some(s) = p.sounds.get_mut(i) {
@@ -435,7 +475,7 @@ impl App {
                         volume: v,
                     });
                 }
-                p.save_bindings();
+                self.bindings_dirty = true;
             }
             need_reregister = true;
         }
@@ -490,7 +530,7 @@ impl App {
                 let p = PathBuf::from(&input);
                 if p.is_absolute() {
                     if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
-                        self.add_external_folder(p, texts.select_folder_dialog_title);
+                        self.add_external_folder(p);
                         self.new_profile_name.clear();
                         self.show_new_profile = false;
                     }
@@ -503,6 +543,7 @@ impl App {
             }
         }
         if let Some((from, to)) = pending.reorder {
+            self.cancel_capture();
             if let Some(p) = self.profile.as_mut() {
                 p.move_sound(from, to);
                 p.save_bindings();
@@ -515,6 +556,7 @@ impl App {
             need_reregister = true;
         }
         if let Some(m) = pending.sort_mode {
+            self.cancel_capture();
             self.config.sort_mode = m;
             self.config.save();
             if let Some(p) = self.profile.as_mut() {
@@ -536,7 +578,6 @@ impl App {
             {
                 self.config.bg_image = Some(f);
                 self.config.save();
-                need_retheme = true;
             }
         }
         if pending.clear_bg_image {
@@ -544,14 +585,13 @@ impl App {
             self.bg_tex = None;
             self.bg_tex_path = None;
             self.config.save();
-            need_retheme = true;
         }
         if pending.pick_folder {
             if let Some(dir) = rfd::FileDialog::new()
                 .set_title(texts.select_folder_dialog_title)
                 .pick_folder()
             {
-                self.add_external_folder(dir, texts.select_folder_dialog_title);
+                self.add_external_folder(dir);
             }
         }
         if let Some(name) = pending.remove_external {
@@ -594,11 +634,11 @@ impl App {
         }
         if pending.rebuild_engine {
             self.rebuild_engine();
+            self.last_dev_check = None;
         }
         if need_reregister {
             self.reregister_hotkeys();
         }
-        let _ = need_retheme; // 主题变化由 update() 里的 sync_theme 统一检测
     }
     // ─────────────────────────── 顶栏 ───────────────────────────
     /// 应用名 + 页面切换 + 锁定 + 语言。
@@ -612,8 +652,12 @@ impl App {
             if ui.selectable_label(self.page == Page::Sounds, texts.tab_sounds).clicked() {
                 self.page = Page::Sounds;
             }
-            if ui.selectable_label(self.page == Page::Settings, texts.tab_settings).clicked() {
+            if ui.selectable_label(self.page == Page::Settings, texts.tab_settings).clicked()
+                && self.page != Page::Settings
+            {
                 self.page = Page::Settings;
+                // 设备列表以前只在启动时枚举一次，之后插上的耳机要重启才选得到。
+                self.refresh_devices();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1080,7 +1124,6 @@ impl App {
         });
     }
 
-    /// 居中的空状态提示。
     /// 方案下拉 + 管理菜单。
     fn ui_scheme_picker(&mut self, ui: &mut egui::Ui, pending: &mut Pending) {
         let texts = self.texts();
@@ -1168,6 +1211,7 @@ impl App {
         }
     }
 
+    /// 居中的空状态提示。
     fn ui_empty_hint(&self, ui: &mut egui::Ui, text: &str) {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
@@ -1442,10 +1486,7 @@ impl App {
                 labeled_row(ui, texts.microphone, |ui| {
                     device_combo(ui, "in", &mut self.config.input_device, in_devices, texts.system_default, &mut pending.rebuild_engine);
                 });
-                if audio::mic_loops_into_output(
-                    self.config.input_device.as_deref(),
-                    self.config.output_device.as_deref(),
-                ) {
+                if self.dev_warn.0 {
                     hint(ui, texts.mic_is_cable, theme::p().warn);
                 }
                 labeled_row_tip(ui, texts.monitor_device, Some(texts.monitor_device_tip), |ui| {
@@ -1601,11 +1642,10 @@ impl App {
                 }
                 hint(ui, texts.loopback_hint, theme::p().dim);
                 if self.config.loopback_enabled {
-                    let cap = self.config.capture_device.as_deref();
-                    if audio::loopback_monitor_conflicts(self.config.monitor_device.as_deref(), cap) {
+                    if self.dev_warn.1 {
                         hint(ui, texts.loopback_monitor_conflict, theme::p().warn);
                     }
-                    if audio::same_output(cap, self.config.output_device.as_deref()) {
+                    if self.dev_warn.2 {
                         hint(ui, texts.capture_is_output, theme::p().dim);
                     }
                     if pending.rebuild_engine {
@@ -1705,10 +1745,20 @@ impl eframe::App for App {
             });
 
         self.apply(pending);
+        if self.page == Page::Settings {
+            self.refresh_dev_warn();
+        }
         // 设置散落在很多地方改，不逐个去挂钩子：每帧对一次，变了就存进当前方案。
-        let now = SchemeSettings::from_config(&self.config);
-        if let Some(p) = self.profile.as_mut() {
-            p.sync_settings(now);
+        // 鼠标还按着（正在拖滑块）时先不写：值每帧都在变，等松手那一帧再落盘，
+        // 否则拖一下音量就是几十次写文件。
+        if !ctx.input(|i| i.pointer.any_down()) {
+            let now = SchemeSettings::from_config(&self.config);
+            if let Some(p) = self.profile.as_mut() {
+                if std::mem::take(&mut self.bindings_dirty) {
+                    p.save_bindings();
+                }
+                p.sync_settings(now);
+            }
         }
 
         // 每 ~2 秒记一次窗口几何，下次启动恢复。
@@ -2072,5 +2122,5 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             return;
         }
     }
-   log::warn!("没找到中文字体，中文可能显示为方块");
+    log::warn!("没找到中文字体，中文可能显示为方块");
 }

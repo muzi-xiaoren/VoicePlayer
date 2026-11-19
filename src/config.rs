@@ -1,4 +1,4 @@
-﻿//! 全局配置与数据目录。
+//! 全局配置与数据目录。
 //!
 //! 数据都放在系统的 AppData 目录下（Windows: `%APPDATA%\VoicePlayer\`）：
 //! ```text
@@ -36,7 +36,7 @@ pub enum SortMode {
     TimeAsc,
     /// 按修改时间，新→旧。
     TimeDesc,
-    /// 自定义：完全按 `_bindings.json` 里存的手动顺序。拖动过一次就自动变成它。
+    /// 自定义：完全按 `_schemes.json` 里存的手动顺序。拖动过一次就自动变成它。
     Custom,
 }
 
@@ -109,8 +109,6 @@ pub struct AppConfig {
     pub language: Option<String>,
     /// 锁定快捷键。锁定后按快捷键不会触发任何音效。
     pub locked: bool,
-    pub loopback_pid: Option<u32>,
-    pub loopback_name: Option<String>,
     pub loopback_enabled: bool,
     pub loopback_volume: f32,
     /// 深色 / 浅色 / 跟随系统。
@@ -153,8 +151,6 @@ impl Default for AppConfig {
             autostart: false,
             language: None,
             locked: false,
-            loopback_pid: None,
-            loopback_name: None,
             loopback_enabled: false,
             loopback_volume: 1.0,
             theme_mode: ThemeMode::default(),

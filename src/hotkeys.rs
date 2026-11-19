@@ -268,7 +268,6 @@ impl Hotkeys {
                 .name("hotkeys".into())
                 .spawn(move || hook_thread(s))
                 .map_err(|e| anyhow::anyhow!("创建热键线程失败：{e}"))?;
-            // 给钩子线程一点时间启动
         }
         Ok(Self {
             shared,
@@ -286,11 +285,6 @@ impl Hotkeys {
         }
         if let Ok(mut a) = self.shared.actions.lock() {
             *a = Arc::new(map);
-        }
-    }
-    pub fn clear(&self) {
-        if let Ok(mut a) = self.shared.actions.lock() {
-            *a = Arc::new(HashMap::new());
         }
     }
     pub fn set_locked(&self, locked: bool) {
@@ -313,9 +307,6 @@ impl Hotkeys {
             *slot = None;
         }
     }
-   pub fn is_capturing(&self) -> bool {
-       self.shared.capturing.load(Ordering::Relaxed)
-   }
     /// 检查低级钩子是否成功安装。
     pub fn hook_installed(&self) -> bool {
         self.shared.hook_installed.load(Ordering::Relaxed)
@@ -402,8 +393,8 @@ fn is_modifier_key(vk: u32) -> bool {
 }
 #[cfg(windows)]
 mod win {
-   use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-   use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetMessageW, KillTimer, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
         HHOOK, MSG, WH_KEYBOARD_LL, WH_MOUSE_LL,
@@ -598,6 +589,9 @@ fn on_button(shared: &HookShared, vk: u32, is_down: bool) {
         if is_down && !is_modifier_key(vk) && (vk == VK_ESCAPE || is_bindable(vk)) {
             let result = if vk == VK_ESCAPE { None } else { Some((win::get_modifiers(), vk)) };
             shared.capturing.store(false, Ordering::Relaxed);
+            // 这个键此刻还按着：记成「已按下」，否则手没松开时的自动重复
+            // 会被当成一次新的按下，刚绑好的音效立刻自己响一声。
+            DOWN_KEYS.with(|dk| { dk.borrow_mut().insert(vk, now_ms()); });
             if let Ok(slot) = shared.capture_tx.lock() {
                 if let Some(tx) = slot.as_ref() { let _ = tx.send(result); }
             }
