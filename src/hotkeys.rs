@@ -14,16 +14,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
+
 /// 修饰键位掩码。
 pub const MOD_CTRL: u8 = 1;
 pub const MOD_ALT: u8 = 2;
 pub const MOD_SHIFT: u8 = 4;
+
 /// 热键触发后要做的事。
 #[derive(Debug, Clone)]
 pub enum HkAction {
     Play { path: PathBuf, volume: f32 },
     StopAll,
 }
+
 // ─── VK code 常量 ───
 const VK_ESCAPE: u32 = 0x1B;
 const VK_LSHIFT: u32 = 0xA0;
@@ -32,15 +35,18 @@ const VK_LCONTROL: u32 = 0xA2;
 const VK_RCONTROL: u32 = 0xA3;
 const VK_LMENU: u32 = 0xA4;
 const VK_RMENU: u32 = 0xA5;
+
 /// 把（修饰键掩码 + VK code）打包成一个 u32 作为 HashMap 的键。
 fn combo_key(mods: u8, vk: u32) -> u32 {
     ((mods as u32) << 16) | (vk & 0xFFFF)
 }
+
 /// 鼠标中键 / 侧键 1（后退）/ 侧键 2（前进）。Windows 本来就给它们分配了 VK code，
 /// 所以鼠标键和键盘键可以放进同一张绑定表，组合、去重、显示全都复用。
 pub const VK_MBUTTON: u32 = 0x04;
 pub const VK_XBUTTON1: u32 = 0x05;
 pub const VK_XBUTTON2: u32 = 0x06;
+
 /// 字母 / 数字 / 小键盘数字 / F 键以外的可绑定键：(VK code, 存储用 token, 显示名)。
 ///
 /// token 会写进 `_schemes.json`，**不能改**；显示名随便改。
@@ -106,13 +112,29 @@ const NAMED_KEYS: &[(u32, &str, &str)] = &[
     (0xDE, "OemQuotes", "'"),
     (0xE2, "Oem102", "Oem102"),
 ];
+
 fn named(vk: u32) -> Option<&'static (u32, &'static str, &'static str)> {
     NAMED_KEYS.iter().find(|(v, _, _)| *v == vk)
 }
+
+/// 主键盘上的键 → 小键盘上打出同一个字符的那个键（1 ↔ 小键盘 1、- ↔ 小键盘 -）。
+/// egui 只报字符、分不清这两个键，凡是要对付这个歧义的地方都查这张表。
+pub fn numpad_twin(vk: u32) -> Option<u32> {
+    match vk {
+        0x30..=0x39 => Some(vk - 0x30 + 0x60),
+        0xBB => Some(0x6B), // = / + -> Num+
+        0xBD => Some(0x6D), // -     -> Num-
+        0xBE => Some(0x6E), // .     -> Num.
+        0xBF => Some(0x6F), // /     -> Num/
+        _ => None,
+    }
+}
+
 /// 这个 VK code 能不能绑。捕获时按到不能绑的键（Win 键之类）就继续等，不当成结果。
 pub fn is_bindable(vk: u32) -> bool {
     matches!(vk, 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x69 | 0x70..=0x87) || named(vk).is_some()
 }
+
 /// VK code → 存储用 token 字符串。None 表示不支持绑定。
 fn vk_to_token(vk: u32) -> Option<String> {
     Some(match vk {
@@ -124,6 +146,7 @@ fn vk_to_token(vk: u32) -> Option<String> {
         _ => named(vk)?.1.to_string(),
     })
 }
+
 /// VK code → 界面上显示的名字（比 token 短，符号键直接显示符号）。
 fn vk_to_display(vk: u32) -> Option<String> {
     Some(match vk {
@@ -134,6 +157,7 @@ fn vk_to_display(vk: u32) -> Option<String> {
         _ => named(vk)?.2.to_string(),
     })
 }
+
 /// token 字符串 → VK code。
 fn token_to_vk(token: &str) -> Option<u32> {
     let t = token.to_lowercase();
@@ -162,6 +186,7 @@ fn token_to_vk(token: &str) -> Option<u32> {
         .find(|(_, tok, _)| tok.eq_ignore_ascii_case(&t))
         .map(|(vk, _, _)| *vk)
 }
+
 fn join_combo(mods: u8, key: String) -> String {
     let mut parts = Vec::new();
     if mods & MOD_CTRL != 0 { parts.push("Ctrl".to_string()); }
@@ -170,10 +195,12 @@ fn join_combo(mods: u8, key: String) -> String {
     parts.push(key);
     parts.join("+")
 }
+
 /// 把 (mods, vk) 格式化成存储用字符串，如 "Ctrl+Alt+KeyW"。
 pub fn format_combo(mods: u8, vk: u32) -> String {
     join_combo(mods, vk_to_token(vk).unwrap_or_else(|| format!("VK{vk:02X}")))
 }
+
 /// 解析存储的 combo 字符串 → (mods, vk)。None = 解析失败。
 pub fn parse_combo(combo: &str) -> Option<(u8, u32)> {
     let mut mods = 0u8;
@@ -189,12 +216,14 @@ pub fn parse_combo(combo: &str) -> Option<(u8, u32)> {
     }
     vk.map(|v| (mods, v))
 }
+
 /// 把存储的 combo 字符串美化显示，如 "Ctrl+Alt+KeyW" → "Ctrl+Alt+W"。
 pub fn pretty_combo(combo: &str) -> String {
     parse_combo(combo)
         .and_then(|(m, v)| Some(join_combo(m, vk_to_display(v)?)))
         .unwrap_or_else(|| combo.to_string())
 }
+
 // ─── 共享状态 ───
 /// 触发来源。两条路都可能收到同一次按键，去重要区分来源。
 #[derive(Clone, Copy, PartialEq)]
@@ -230,16 +259,21 @@ struct HookShared {
     mouse_installed: AtomicBool,
     /// 鼠标钩子最近一次收到任意鼠标事件（含移动）的时刻，给看门狗用。
     mouse_last_event: AtomicU64,
+    /// 鼠标钩子收到过事件没有。和 `event_count` 一起判断「钩子是不是被系统挡住了」。
+    mouse_seen: AtomicBool,
 }
+
 /// 钩子回调要用到的共享状态。回调是**系统级热路径**（每一次按键都会走），
 /// 所以这里用 OnceLock 而不是 Mutex：回调里不加锁，避免被 UI 线程卡住 ——
 /// 低级钩子回调超时（默认 300ms）会被 Windows 直接摘掉，且不会有任何通知。
 static SHARED: OnceLock<Arc<HookShared>> = OnceLock::new();
+
 /// UI 端的热键管理句柄。
 pub struct Hotkeys {
     shared: Arc<HookShared>,
     capture_rx: Option<Receiver<Option<(u8, u32)>>>,
 }
+
 impl Hotkeys {
     pub fn new<F>(on_action: F) -> anyhow::Result<Self>
     where
@@ -260,6 +294,7 @@ impl Hotkeys {
             reinstalls: AtomicU32::new(0),
             mouse_installed: AtomicBool::new(false),
             mouse_last_event: AtomicU64::new(0),
+            mouse_seen: AtomicBool::new(false),
         });
         #[cfg(windows)]
         {
@@ -274,6 +309,7 @@ impl Hotkeys {
             capture_rx: None,
         })
     }
+
     pub fn update_bindings(&self, bindings: &[(String, HkAction)]) {
         let mut map = HashMap::new();
         for (combo, action) in bindings {
@@ -287,9 +323,11 @@ impl Hotkeys {
             *a = Arc::new(map);
         }
     }
+
     pub fn set_locked(&self, locked: bool) {
         self.shared.locked.store(locked, Ordering::Relaxed);
     }
+
     pub fn start_capture(&mut self) {
         let (tx, rx) = mpsc::channel();
         if let Ok(mut slot) = self.shared.capture_tx.lock() {
@@ -298,37 +336,51 @@ impl Hotkeys {
         self.shared.capturing.store(true, Ordering::Relaxed);
         self.capture_rx = Some(rx);
     }
+
     pub fn poll_capture(&self) -> Option<Option<(u8, u32)>> {
         self.capture_rx.as_ref()?.try_recv().ok()
     }
+
     pub fn stop_capture(&self) {
         self.shared.capturing.store(false, Ordering::Relaxed);
         if let Ok(mut slot) = self.shared.capture_tx.lock() {
             *slot = None;
         }
     }
+
     /// 检查低级钩子是否成功安装。
     pub fn hook_installed(&self) -> bool {
         self.shared.hook_installed.load(Ordering::Relaxed)
     }
+
     /// 钩子回调累计收到的键盘事件数。装上了但这个数一直不涨 = 钩子实际没在工作
     /// （典型原因：前台程序是管理员权限运行的，本程序不是）。
     pub fn event_count(&self) -> u64 {
         self.shared.event_count.load(Ordering::Relaxed)
     }
+
     /// 距上一次收到键盘事件过去了多少毫秒。从没收到过时返回 None。
     pub fn idle_ms(&self) -> Option<u64> {
         let t = self.shared.last_event.load(Ordering::Relaxed);
         (t != 0).then(|| now_ms().saturating_sub(t))
     }
+
+    /// 钩子收到过输入没有（键盘或鼠标都算）。装上了却一直没收到 = 被系统挡住了。
+    /// 鼠标也算进来，是因为开机自启后可能很久都只动鼠标不按键，光看键盘会误报。
+    pub fn input_seen(&self) -> bool {
+        self.event_count() > 0 || self.shared.mouse_seen.load(Ordering::Relaxed)
+    }
+
     /// 钩子自愈重装了几次。
     pub fn reinstalls(&self) -> u32 {
         self.shared.reinstalls.load(Ordering::Relaxed)
     }
+
     /// 鼠标钩子是否装上了（没装上时鼠标键绑定只在窗口前台时有效）。
     pub fn mouse_installed(&self) -> bool {
         self.shared.mouse_installed.load(Ordering::Relaxed)
     }
+
     /// 用 VK code 直接触发（egui 前台后备路径调用）。
     pub fn trigger_from_vk(&self, mods: u8, vk: u32) {
         self.shared.fire(mods, vk, Src::Egui);
@@ -368,7 +420,11 @@ impl HookShared {
             Src::Egui => {
                 let hk = self.hook_fire_key.load(Ordering::Relaxed);
                 let ht = self.hook_fire_time.load(Ordering::Relaxed);
-                if hk == key && now.saturating_sub(ht) < 300 {
+                // 小键盘键在 egui 这边可能被认成主键盘上的同字符键：分辨靠的是
+                // 「这一帧小键盘键还按着没有」，点得快、这一帧到来时已经松手就认错了。
+                // 所以钩子刚为「小键盘上的那个孪生键」触发过，也算同一次按键。
+                let twin = numpad_twin(vk).map(|t| combo_key(mods, t));
+                if (hk == key || Some(hk) == twin) && now.saturating_sub(ht) < 300 {
                     return; // 同一次按键钩子已经处理过了
                 }
             }
@@ -380,17 +436,20 @@ impl HookShared {
         }
     }
 }
+
 impl Drop for Hotkeys {
     fn drop(&mut self) {
         self.shared.active.store(false, Ordering::Relaxed);
     }
 }
+
 fn is_modifier_key(vk: u32) -> bool {
     matches!(
         vk,
         VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU
     )
 }
+
 #[cfg(windows)]
 mod win {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -403,6 +462,7 @@ mod win {
     pub(super) use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT,
     };
+
     pub(super) const HC_ACTION: i32 = 0;
     pub(super) const WM_KEYDOWN: usize = 0x0100;
     pub(super) const WM_KEYUP: usize = 0x0101;
@@ -412,6 +472,7 @@ mod win {
     pub(super) const WM_MBUTTONUP: usize = 0x0208;
     pub(super) const WM_XBUTTONDOWN: usize = 0x020B;
     pub(super) const WM_XBUTTONUP: usize = 0x020C;
+
     unsafe fn install(id: i32, proc_: unsafe extern "system" fn(i32, usize, isize) -> isize) -> Option<HHOOK> {
         let hinst = GetModuleHandleW(std::ptr::null_mut());
         if hinst.is_null() {
@@ -425,12 +486,15 @@ mod win {
         }
         Some(hook)
     }
+
     pub(super) unsafe fn install_hook() -> Option<HHOOK> {
         install(WH_KEYBOARD_LL, hook_proc)
     }
+
     pub(super) unsafe fn install_mouse_hook() -> Option<HHOOK> {
         install(WH_MOUSE_LL, mouse_proc)
     }
+
     /// 消息循环 + 看门狗。
     ///
     /// 低级钩子被系统摘掉（回调超时、会话切换、某些安全软件）时**不会有任何通知**，
@@ -500,9 +564,11 @@ mod win {
             KillTimer(std::ptr::null_mut(), timer);
         }
     }
+
     pub(super) unsafe fn remove_hook(hook: HHOOK) {
         UnhookWindowsHookEx(hook);
     }
+
     pub(super) fn get_modifiers() -> u8 {
         use super::{
             VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
@@ -528,13 +594,16 @@ mod win {
             mods
         }
     }
+
     unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
         crate::hotkeys::hook_callback(code, wparam, lparam)
     }
+
     unsafe extern "system" fn mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
         crate::hotkeys::mouse_callback(code, wparam, lparam)
     }
 }
+
 #[cfg(windows)]
 fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
     if code == win::HC_ACTION {
@@ -553,12 +622,14 @@ fn hook_callback(code: i32, wparam: usize, lparam: isize) -> isize {
     }
     unsafe { win::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
+
 /// 鼠标钩子回调。每一次鼠标移动都会走这里，所以除了中键 / 侧键，其他事件只记个心跳就放行。
 #[cfg(windows)]
 fn mouse_callback(code: i32, wparam: usize, lparam: isize) -> isize {
     if code == win::HC_ACTION {
         if let Some(shared) = SHARED.get().filter(|s| s.active.load(Ordering::Relaxed)) {
             shared.mouse_last_event.store(now_ms(), Ordering::Relaxed);
+            shared.mouse_seen.store(true, Ordering::Relaxed);
             let button = match wparam {
                 win::WM_MBUTTONDOWN => Some((VK_MBUTTON, true)),
                 win::WM_MBUTTONUP => Some((VK_MBUTTON, false)),
@@ -581,6 +652,7 @@ fn mouse_callback(code: i32, wparam: usize, lparam: isize) -> isize {
     }
     unsafe { win::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
+
 /// 键盘和鼠标钩子共用的按键处理：捕获模式下交出结果，否则按下去重后触发。
 #[cfg(windows)]
 fn on_button(shared: &HookShared, vk: u32, is_down: bool) {
@@ -621,6 +693,7 @@ fn on_button(shared: &HookShared, vk: u32, is_down: bool) {
         DOWN_KEYS.with(|dk| { dk.borrow_mut().remove(&vk); });
     }
 }
+
 /// 多久没再收到某个键的事件就认为它已经松开（漏收 key-up 时的兜底）。
 #[cfg(windows)]
 const STALE_MS: u64 = 5_000;
@@ -631,6 +704,7 @@ thread_local! {
     static DOWN_KEYS: std::cell::RefCell<HashMap<u32, u64>> =
         std::cell::RefCell::new(HashMap::new());
 }
+
 #[cfg(windows)]
 fn hook_thread(shared: Arc<HookShared>) {
     let _ = SHARED.set(shared.clone());
@@ -661,5 +735,6 @@ fn hook_thread(shared: Arc<HookShared>) {
     }
     shared.active.store(false, Ordering::Relaxed);
 }
+
 #[cfg(not(windows))]
 fn hook_thread(_shared: Arc<HookShared>) {}

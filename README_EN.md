@@ -9,7 +9,8 @@ chat can hear them — while **your normal speech is unaffected**.
 ## Features
 
 - **Multi-sound mixing**: multiple sounds play simultaneously without interfering
-- **Hotkey binding**: bind a global hotkey per sound, plus a dedicated "stop all" hotkey. Almost every key works:
+- **Hotkey binding**: bind a global hotkey per sound, plus a dedicated "stop all" hotkey.
+  A key belongs to one sound only — a new binding takes it away from the old one. Almost every key works:
   letters, digits, symbol keys, the numpad (including `+ - * / .`), F1–F24, arrows,
   PrintScreen / ScrollLock / Pause, media keys, all combinable with Ctrl / Alt / Shift
 - **Mouse button binding**: middle button and the two side buttons (shown as Mouse3 / Mouse4 / Mouse5).
@@ -55,6 +56,9 @@ Since mixing happens inside the app, **you don't need VoiceMeeter** — just a s
 > Note: Your game mic is set to CABLE Output, so **VoicePlayer must stay open** to
 > forward your real mic. Closing the app means the game gets no mic audio.
 > Enable "Launch on startup" for convenience.
+> If you tick it while running as administrator, it is set up as a scheduled task that starts elevated at logon
+> (no UAC prompt). Without admin rights it falls back to a normal startup entry, and switches over automatically
+> the next time you run the app as administrator.
 
 ## System Audio Capture (Two Methods)
 

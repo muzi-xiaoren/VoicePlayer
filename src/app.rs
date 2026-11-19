@@ -115,6 +115,10 @@ pub struct App {
     new_profile_name: String,
     /// 「新建配置」输入框是否展开。
     show_new_profile: bool,
+    /// 上次新建配置没建成（名字非法 / 路径写不了），在输入框下面提示。
+    new_profile_error: bool,
+    /// 上次改开机自启失败的原因，显示在那个勾选框下面。
+    autostart_error: Option<String>,
     /// 方案操作行：(在做什么, 输入的名字, 上次提交是否因重名 / 空名被拒)。None = 收起。
     scheme_edit: Option<(SchemeEdit, String, bool)>,
     /// 音效搜索关键字。
@@ -183,7 +187,19 @@ impl App {
             .as_ref()
             .map(|p| Profile::file_signature(&p.dir))
             .unwrap_or_default();
-        let audio = audio::spawn(config.clone());
+        let audio = {
+            let ctx = cc.egui_ctx.clone();
+            audio::spawn(config.clone(), move || ctx.request_repaint())
+        };
+        if config.autostart {
+            // 自启项里记的是当时的 exe 路径，换目录重装后就失效了；每次启动对一遍。
+            // 放到后台线程：要起子进程，别拖慢开窗。
+            std::thread::spawn(|| {
+                if let Err(e) = platform::set_autostart(true) {
+                    log::warn!("刷新开机自启失败：{e}");
+                }
+            });
+        }
         // 全局热键：用低级键盘钩子，回调直接驱动音频线程。
         let hotkeys = {
             let audio2 = audio.clone();
@@ -208,6 +224,8 @@ impl App {
             capturing: None,
             new_profile_name: String::new(),
             show_new_profile: false,
+            new_profile_error: false,
+            autostart_error: None,
             scheme_edit: None,
             search: String::new(),
             page: Page::Sounds,
@@ -427,8 +445,15 @@ impl App {
         if let (Some((mods, vk)), Some(target)) = (capture_result, target) {
             let combo = hotkeys::format_combo(mods, vk);
             match target {
+                // 一个快捷键只留一个主人：新绑的把别处相同的顶掉。
                 CaptureTarget::Sound(i) => {
+                    let parsed = hotkeys::parse_combo(&combo);
+                    if self.config.stop_hotkey.as_deref().is_some_and(|h| hotkeys::parse_combo(h) == parsed) {
+                        self.config.stop_hotkey = None;
+                        self.config.save();
+                    }
                     if let Some(p) = self.profile.as_mut() {
+                        p.release_hotkey(&combo, Some(i));
                         if let Some(s) = p.sounds.get_mut(i) {
                             s.hotkey = Some(combo);
                         }
@@ -436,6 +461,10 @@ impl App {
                     }
                 }
                 CaptureTarget::Stop => {
+                    if let Some(p) = self.profile.as_mut() {
+                        p.release_hotkey(&combo, None);
+                        p.save_bindings();
+                    }
                     self.config.stop_hotkey = Some(combo);
                     self.config.save();
                 }
@@ -528,15 +557,25 @@ impl App {
             let input = input.trim().to_string();
             if !input.is_empty() {
                 let p = PathBuf::from(&input);
-                if p.is_absolute() {
-                    if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
+                // Windows 文件夹名里不能有这些字符；结尾的点会被系统悄悄吃掉，名字就对不上了。
+                let valid_name = !input.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
+                    && !input.chars().any(char::is_control)
+                    && !input.ends_with('.');
+                let ok = if p.is_absolute() {
+                    let ok = p.is_dir() || std::fs::create_dir_all(&p).is_ok();
+                    if ok {
                         self.add_external_folder(p);
-                        self.new_profile_name.clear();
-                        self.show_new_profile = false;
                     }
-                } else if !input.contains('/') && !input.contains('\\') && profile::create_profile(&input).is_ok() {
+                    ok
+                } else if valid_name && profile::create_profile(&input).is_ok() {
                     self.profiles = Self::all_profiles(&self.config, texts.default_profile);
                     self.switch_profile(&input);
+                    true
+                } else {
+                    false
+                };
+                self.new_profile_error = !ok;
+                if ok {
                     self.new_profile_name.clear();
                     self.show_new_profile = false;
                 }
@@ -714,7 +753,7 @@ impl App {
                     ui.separator();
                 }
                 Some(h)
-                    if h.event_count() == 0
+                    if !h.input_seen()
                         && self.started.elapsed() >= Duration::from_secs(30) =>
                 {
                     theme::status_dot(ui, theme::p().warn, texts.hook_blocked);
@@ -837,6 +876,7 @@ impl App {
                 .clicked()
             {
                 self.show_new_profile = !self.show_new_profile;
+                self.new_profile_error = false;
             }
             if is_external && ui.button("✖").on_hover_text(texts.remove_tooltip).clicked() {
                 pending.remove_external = self.config.active_profile.clone();
@@ -892,6 +932,9 @@ impl App {
                     pending.new_profile = Some(self.new_profile_name.clone());
                 }
             });
+            if self.new_profile_error {
+                hint(ui, texts.profile_name_invalid, theme::p().warn);
+            }
         }
         // ── 方案 + 搜索 ──
         ui.horizontal(|ui| {
@@ -1100,6 +1143,10 @@ impl App {
                         d.press_at = f64::MAX;
                     } else if ui.input(|inp| inp.time) - d.press_at >= LONG_PRESS && down {
                         d.active = true;
+                    } else if down {
+                        // 按住不动时没有任何输入事件，界面空闲又刷得慢，
+                        // 不主动要下一帧的话长按要等半秒才被发现。
+                        ui.ctx().request_repaint();
                     }
                 }
             }
@@ -1489,6 +1536,9 @@ impl App {
                 if self.dev_warn.0 {
                     hint(ui, texts.mic_is_cable, theme::p().warn);
                 }
+                if let Some(e) = self.audio.mic_warning() {
+                    hint(ui, &format!("{}{e}", texts.mic_failed), theme::p().warn);
+                }
                 labeled_row_tip(ui, texts.monitor_device, Some(texts.monitor_device_tip), |ui| {
                     device_combo(ui, "mon", &mut self.config.monitor_device, out_devices, texts.no_monitor, &mut pending.rebuild_engine);
                 });
@@ -1585,7 +1635,7 @@ impl App {
                 if let Some(hk) = &self.hotkeys {
                     let installed = hk.hook_installed();
                     let events = hk.event_count();
-                    let ok = installed && events > 0;
+                    let ok = installed && hk.input_seen();
                     labeled_row_tip(ui, texts.hook_diag, Some(texts.hook_diag_tip), |ui| {
                         let color = if ok { theme::p().ok } else { theme::p().danger };
                         let idle = hk
@@ -1665,10 +1715,16 @@ impl App {
                 ui.set_width(w - 26.0);
                 theme::section_title(ui, texts.section_startup);
                 if ui.checkbox(&mut self.config.autostart, texts.autostart).changed() {
-                    if let Err(e) = platform::set_autostart(self.config.autostart) {
-                        log::error!("设置开机自启失败：{e}");
-                    }
+                    self.autostart_error = platform::set_autostart(self.config.autostart)
+                        .err()
+                        .map(|e| {
+                            log::error!("设置开机自启失败：{e}");
+                            e.to_string()
+                        });
                     self.config.save();
+                }
+                if let Some(e) = &self.autostart_error {
+                    hint(ui, &format!("{}{e}", texts.autostart_failed), theme::p().warn);
                 }
             });
 
@@ -1693,8 +1749,11 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 始终以 ~50ms 刷帧：保证快捷键触发响应及时（egui 后备触发依赖刷帧）。
-        ctx.request_repaint_after(Duration::from_millis(50));
+        // 空闲时半秒醒一次就够（扫文件夹、记窗口位置、钩子状态）：
+        // 键鼠输入和动画 egui 自己会立刻重画，播放状态变了音频线程会来叫醒。
+        // 只有捕获快捷键时要勤快点 —— 结果是钩子线程塞进通道的，得靠轮询去取。
+        let tick = if self.capturing.is_some() { 50 } else { 500 };
+        ctx.request_repaint_after(Duration::from_millis(tick));
         self.sync_theme(ctx);
         if let Some(tex) = &self.bg_tex {
             theme::paint_background(ctx, tex, self.config.bg_opacity);
@@ -1710,7 +1769,9 @@ impl eframe::App for App {
         let out_devices = self.out_devices.clone();
         let in_devices = self.in_devices.clone();
         let profiles = self.profiles.clone();
-        let sounds = self.profile.as_ref().map(|p| p.sounds.clone()).unwrap_or_default();
+        // 界面要同时拿着 `&mut self` 和音效列表，所以先把列表整个借出来、画完再还回去
+        // （以前是每帧克隆一份）。借出期间 `profile.sounds` 是空的，画界面的代码不能读它。
+        let sounds = self.profile.as_mut().map(|p| std::mem::take(&mut p.sounds)).unwrap_or_default();
         let playing = self.audio.playing_snapshot();
         let presets = self.config.volume_presets.clone();
         let mut pending = Pending::default();
@@ -1744,6 +1805,9 @@ impl eframe::App for App {
                 Page::Settings => self.ui_settings(ui, &out_devices, &in_devices, &mut pending),
             });
 
+        if let Some(p) = self.profile.as_mut() {
+            p.sounds = sounds;
+        }
         self.apply(pending);
         if self.page == Page::Settings {
             self.refresh_dev_warn();
@@ -2059,14 +2123,7 @@ fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
 #[cfg(windows)]
 fn disambiguate_numpad(vk: u32) -> u32 {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    let numpad_vk = match vk {
-        0x30..=0x39 => vk - 0x30 + 0x60, // Digit0=0x30 -> Numpad0=0x60
-        0xBB => 0x6B,                    // = / + -> Num+
-        0xBD => 0x6D,                    // -     -> Num-
-        0xBE => 0x6E,                    // .     -> Num.
-        0xBF => 0x6F,                    // /     -> Num/
-        _ => return vk,
-    };
+    let Some(numpad_vk) = hotkeys::numpad_twin(vk) else { return vk };
     unsafe {
         if GetAsyncKeyState(numpad_vk as i32) < 0 {
             return numpad_vk;

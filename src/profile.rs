@@ -222,7 +222,36 @@ impl Profile {
                 );
             }
         }
-        self.schemes.entry(self.scheme.clone()).or_default().bindings = map;
+        // 文件此刻不在文件夹里的绑定原样留着：外部文件夹没挂上（U 盘没插）时列表是空的，
+        // 照着空列表存就把整套键位清掉了；文件删了又放回来也能拿回原来的设置。
+        let scheme = self.schemes.entry(self.scheme.clone()).or_default();
+        for (fname, b) in std::mem::take(&mut scheme.bindings) {
+            map.entry(fname).or_insert(b);
+        }
+        scheme.bindings = map;
+    }
+
+    /// 把 `combo` 从当前方案里别的音效上摘掉（`keep` 那一项除外），不落盘。
+    /// 一个快捷键只能触发一个动作，新绑的要把旧的顶掉，否则谁生效全看运气。
+    pub fn release_hotkey(&mut self, combo: &str, keep: Option<usize>) {
+        let want = crate::hotkeys::parse_combo(combo);
+        let same = |h: &Option<String>| {
+            h.as_deref().is_some_and(|h| h == combo || (want.is_some() && crate::hotkeys::parse_combo(h) == want))
+        };
+        for (i, s) in self.sounds.iter_mut().enumerate() {
+            if Some(i) != keep && same(&s.hotkey) {
+                s.hotkey = None;
+            }
+        }
+        // 文件暂时不在的那些绑定也要摘，不然文件一回来又撞上。
+        // 在场音效的条目存盘时会按 `sounds` 重写，这里顺手清掉也无妨。
+        if let Some(scheme) = self.schemes.get_mut(&self.scheme) {
+            for b in scheme.bindings.values_mut() {
+                if same(&b.hotkey) {
+                    b.hotkey = None;
+                }
+            }
+        }
     }
 
     fn write(&self) {

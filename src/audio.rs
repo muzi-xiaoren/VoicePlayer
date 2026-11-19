@@ -188,6 +188,8 @@ pub enum AudioCmd {
 pub struct AudioCtl {
     tx: Sender<AudioCmd>,
     error: Arc<Mutex<Option<String>>>,
+    /// 引擎起来了、但麦克风转发没起来的原因（None = 正常）。
+    mic_warning: Arc<Mutex<Option<String>>>,
     /// 当前有音轨在播的音频文件。音频线程每轮循环刷新，界面据此高亮。
     playing: Arc<Mutex<HashSet<PathBuf>>>,
 }
@@ -202,6 +204,11 @@ impl AudioCtl {
         self.error.lock().ok().and_then(|e| e.clone())
     }
 
+    /// 麦克风转发没启动的原因（None = 正常，或者是被回授保护主动跳过的）。
+    pub fn mic_warning(&self) -> Option<String> {
+        self.mic_warning.lock().ok().and_then(|e| e.clone())
+    }
+
     /// 正在播放的文件集合快照（界面每帧取一次，别在每个瓦片里各锁一遍）。
     pub fn playing_snapshot(&self) -> HashSet<PathBuf> {
         self.playing.lock().map(|p| p.clone()).unwrap_or_default()
@@ -209,16 +216,35 @@ impl AudioCtl {
 }
 
 /// 启动音频线程，返回控制柄。
-pub fn spawn(cfg: AppConfig) -> AudioCtl {
+///
+/// `wake` 在界面该重画的时候被调（正在播放的集合变了、引擎重建完了）。
+/// 界面空闲时刷得很慢，后台按热键触发的播放要靠它才能立刻亮起来。
+pub fn spawn(cfg: AppConfig, wake: impl Fn() + Send + 'static) -> AudioCtl {
     let (tx, rx) = mpsc::channel();
-    let error = Arc::new(Mutex::new(None));
-    let playing = Arc::new(Mutex::new(HashSet::new()));
-    let error2 = error.clone();
-    let playing2 = playing.clone();
+    let ctl = AudioCtl {
+        tx,
+        error: Arc::new(Mutex::new(None)),
+        mic_warning: Arc::new(Mutex::new(None)),
+        playing: Arc::new(Mutex::new(HashSet::new())),
+    };
+    // 只把几个状态槽交给音频线程，不给它 `tx`：
+    // 线程自己拿着一个 Sender 的话，界面退出后通道永远不会断开，线程就收不到退出信号。
+    let slots = Slots {
+        error: ctl.error.clone(),
+        mic_warning: ctl.mic_warning.clone(),
+        playing: ctl.playing.clone(),
+    };
     let _ = std::thread::Builder::new()
         .name("audio".into())
-        .spawn(move || audio_thread(cfg, rx, error2, playing2));
-    AudioCtl { tx, error, playing }
+        .spawn(move || audio_thread(cfg, rx, slots, wake));
+    ctl
+}
+
+/// 音频线程往界面回报状态用的几个槽（和 `AudioCtl` 里的是同一份）。
+struct Slots {
+    error: Arc<Mutex<Option<String>>>,
+    mic_warning: Arc<Mutex<Option<String>>>,
+    playing: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 fn set_error(slot: &Arc<Mutex<Option<String>>>, e: Option<String>) {
@@ -227,26 +253,26 @@ fn set_error(slot: &Arc<Mutex<Option<String>>>, e: Option<String>) {
     }
 }
 
-fn build_engine(cfg: &AppConfig, error: &Arc<Mutex<Option<String>>>) -> Option<AudioEngine> {
-    match AudioEngine::new(cfg) {
+fn build_engine(cfg: &AppConfig, ctl: &Slots, wake: &dyn Fn()) -> Option<AudioEngine> {
+    let engine = match AudioEngine::new(cfg) {
         Ok(e) => {
-            set_error(error, None);
+            set_error(&ctl.error, None);
+            set_error(&ctl.mic_warning, e.mic_error.clone());
             Some(e)
         }
         Err(e) => {
-            set_error(error, Some(format!("{e:#}")));
+            set_error(&ctl.error, Some(format!("{e:#}")));
+            set_error(&ctl.mic_warning, None);
             None
         }
-    }
+    };
+    wake();
+    engine
 }
 
-fn audio_thread(
-    mut cfg: AppConfig,
-    rx: Receiver<AudioCmd>,
-    error: Arc<Mutex<Option<String>>>,
-    playing: Arc<Mutex<HashSet<PathBuf>>>,
-) {
-    let mut engine = build_engine(&cfg, &error);
+fn audio_thread(mut cfg: AppConfig, rx: Receiver<AudioCmd>, ctl: Slots, wake: impl Fn()) {
+    let playing = &ctl.playing;
+    let mut engine = build_engine(&cfg, &ctl, &wake);
     loop {
         // 带超时的等待：空闲时也定期醒来清理已放完的 Sink。
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -290,7 +316,7 @@ fn audio_thread(
                     if let Some(mut en) = engine.take() {
                         en.shutdown();
                     }
-                    engine = build_engine(&cfg, &error);
+                    engine = build_engine(&cfg, &ctl, &wake);
                 }
             },
             Err(RecvTimeoutError::Timeout) => {}
@@ -307,6 +333,7 @@ fn audio_thread(
         if let Ok(mut p) = playing.lock() {
             if *p != snapshot {
                 *p = snapshot;
+                wake();
             }
         }
     }
@@ -342,6 +369,8 @@ struct AudioEngine {
     // 麦克风采集流，拿住不能 drop
     _mic_stream: Option<cpal::Stream>,
     mic_enabled: Arc<AtomicBool>,
+    /// 麦克风转发没起来的原因，给界面显示。
+    mic_error: Option<String>,
     effect_volume: f32,
     loopback_thread: Option<std::thread::JoinHandle<()>>,
     loopback_stop: Arc<AtomicBool>,
@@ -374,6 +403,7 @@ impl AudioEngine {
 
         // —— 麦克风采集 + 转发 ——
         let mic_enabled = Arc::new(AtomicBool::new(cfg.mic_passthrough));
+        let mut mic_error = None;
         let mic_stream = if mic_loops_into_output(cfg.input_device.as_deref(), cfg.output_device.as_deref()) {
             log::warn!("麦克风就是主输出那条虚拟线的另一头（CABLE Output），跳过转发，否则会回授");
             None
@@ -381,7 +411,8 @@ impl AudioEngine {
             match Self::start_mic(cfg.input_device.as_deref(), &out_handle, mic_enabled.clone()) {
                 Ok(stream) => Some(stream),
                 Err(e) => {
-                    log::warn!("麦克风转发未启动：{e}");
+                    log::warn!("麦克风转发未启动：{e:#}");
+                    mic_error = Some(format!("{e:#}"));
                     None
                 }
             }
@@ -456,6 +487,7 @@ impl AudioEngine {
             mon_handle,
             _mic_stream: mic_stream,
             mic_enabled,
+            mic_error,
             effect_volume: cfg.effect_volume,
             loopback_thread,
             loopback_stop,

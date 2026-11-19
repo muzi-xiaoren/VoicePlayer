@@ -231,6 +231,9 @@ pub struct Texts {
     pub default_scheme: &'static str,
     pub cancel: &'static str,
     pub mic_is_cable: &'static str,
+    pub mic_failed: &'static str,
+    pub profile_name_invalid: &'static str,
+    pub autostart_failed: &'static str,
 }
 
 impl Texts {
@@ -371,6 +374,9 @@ impl Texts {
             default_scheme: "默认方案",
             cancel: "取消",
             mic_is_cable: "麦克风现在指向 CABLE Output（Windows 默认录音设备被切过去了？），它就是本程序输出的另一头，录下来再转发会回授，所以已跳过转发。这里请直接选你的真麦克风。",
+            mic_failed: "麦克风转发没有启动，对方只能听到音效、听不到你说话：",
+            profile_name_invalid: "建不了这个配置：名字里不能有 \\ / : * ? \" < > | 这些字符；填完整路径时请确认那个位置可以写入。",
+            autostart_failed: "开机自启没有设置成功：",
         })
     }
 
@@ -493,6 +499,9 @@ impl Texts {
             default_scheme: "Default",
             cancel: "Cancel",
             mic_is_cable: "The microphone resolves to CABLE Output (did the Windows default recording device get switched?). That is the other end of this app's output, so forwarding it would feed back — passthrough is skipped. Pick your real microphone here.",
+            mic_failed: "Microphone passthrough did not start — others will hear sound effects but not your voice: ",
+            profile_name_invalid: "Could not create this profile: the name must not contain \\ / : * ? \" < > |. For a full path, make sure the location is writable.",
+            autostart_failed: "Could not change launch-at-startup: ",
         })
     }
 }
